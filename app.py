@@ -36,7 +36,7 @@ layout="wide",
 
 # ==========================
 
-BASE_DIR = os.path.dirname(**file**)
+BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
 CSV_PNCP_PATHS = [

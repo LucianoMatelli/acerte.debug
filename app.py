@@ -244,7 +244,15 @@ def load_municipios_pncp() -> pd.DataFrame:
             for enc in encodings:
                 for sep in seps:
                     try:
-                        df = pd.read_csv(path, dtype=str, sep=sep, encoding=enc, engine="python", on_bad_lines="skip")
+                       df = pd.read_csv(
+    path,
+    dtype=str,
+    sep=sep,
+    encoding=enc,
+    encoding_errors="replace",
+    engine="python",
+    on_bad_lines="skip"
+)
                         if df is None or df.shape[0] == 0 or df.shape[1] == 0:
                             continue
                         col_nome, col_codigo, col_uf = _guess_columns(df)

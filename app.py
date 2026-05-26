@@ -59,7 +59,7 @@ HEADERS = {
 TAM_PAGINA_FIXO = 100
 CONSULTA_TAM_PAGINA = 100
 CONSULTA_MAX_PAGINAS_MODALIDADE = 3
-CONSULTA_DIAS_PUBLICACAO = 365
+CONSULTA_DIAS_PUBLICACAO = 120
 CONSULTA_TIMEOUT_HTTP = 12
 CONSULTA_MAX_REQUISICOES_MUNICIPIO = 120
 CONSULTA_MAX_SEGUNDOS_MUNICIPIO = 40
@@ -115,12 +115,8 @@ CFG_CONSULTA_MAX_ERROS_CONSECUTIVOS = _secret_int(
     "PNCP_CONSULTA_MAX_ERROS_CONSECUTIVOS",
     CONSULTA_MAX_ERROS_CONSECUTIVOS,
 )
-CFG_ENABLE_FALLBACK_SCAN = str(st.secrets.get("PNCP_ENABLE_FALLBACK_SCAN", "false")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+# Mantido fixo em False para evitar mistura de campos com o fluxo legado de varredura.
+CFG_ENABLE_FALLBACK_SCAN = False
 
 
 def _norm(s: str) -> str:
@@ -445,7 +441,9 @@ def _status_compativel_consulta(status_value: str, situacao_id: Optional[int], d
         return True
 
     agora = pd.Timestamp.now(tz=None)
-    fim = pd.to_datetime(data_encerramento, errors="coerce", utc=False)
+    fim = pd.to_datetime(data_encerramento, errors="coerce", utc=True)
+    if pd.notna(fim):
+        fim = fim.tz_localize(None)
     is_fechada_data = bool(pd.notna(fim) and fim < agora)
 
     if status_value == "recebendo_proposta":
@@ -470,29 +468,41 @@ def _status_compativel_consulta(status_value: str, situacao_id: Optional[int], d
     return True
 
 
-def _consulta_get_items(url: str, params: Dict) -> Tuple[List[Dict], Optional[str]]:
+def _consulta_get_items(url: str, params: Dict) -> Tuple[List[Dict], Optional[str], Dict[str, int]]:
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=CFG_CONSULTA_TIMEOUT_HTTP)
     except Exception as e:
-        return [], f"request_error:{e}"
+        return [], f"request_error:{e}", {}
 
     if r.status_code in (204, 404):
-        return [], None
+        return [], None, {}
     if r.status_code >= 400:
-        return [], f"http_{r.status_code}"
+        return [], f"http_{r.status_code}", {}
 
     body = (r.text or "").strip()
     ctype = (r.headers.get("content-type") or "").lower()
     if "json" not in ctype and not body.startswith("{") and not body.startswith("["):
-        return [], "non_json"
+        return [], "non_json", {}
 
     try:
         js = r.json()
     except Exception as e:
-        return [], f"json_error:{e}"
+        return [], f"json_error:{e}", {}
 
+    meta: Dict[str, int] = {}
+    if isinstance(js, dict):
+        try:
+            if js.get("totalPaginas") is not None:
+                meta["totalPaginas"] = int(js.get("totalPaginas"))
+        except Exception:
+            pass
+        try:
+            if js.get("numeroPagina") is not None:
+                meta["numeroPagina"] = int(js.get("numeroPagina"))
+        except Exception:
+            pass
     itens = js if isinstance(js, list) else _items_from_json(js)
-    return (itens if isinstance(itens, list) else []), None
+    return (itens if isinstance(itens, list) else []), None, meta
 
 
 def _consultar_pncp_api_consulta(
@@ -531,13 +541,22 @@ def _consultar_pncp_api_consulta(
         if req_count >= CFG_CONSULTA_MAX_REQUISICOES_MUNICIPIO:
             limite_req_atingido = True
             break
-        for pagina in range(1, CFG_CONSULTA_MAX_PAGINAS_MODALIDADE + 1):
+
+        paginas_planejadas: List[int] = [1]
+        paginas_visitadas = set()
+
+        while paginas_planejadas:
             if (time.monotonic() - t0) >= CFG_CONSULTA_MAX_SEGUNDOS_MUNICIPIO:
                 limite_tempo_atingido = True
                 break
             if req_count >= CFG_CONSULTA_MAX_REQUISICOES_MUNICIPIO:
                 limite_req_atingido = True
                 break
+
+            pagina = int(paginas_planejadas.pop(0))
+            if pagina in paginas_visitadas or pagina <= 0:
+                continue
+            paginas_visitadas.add(pagina)
 
             params: Dict[str, str | int] = {
                 "codigoModalidadeContratacao": modalidade_id,
@@ -555,7 +574,7 @@ def _consultar_pncp_api_consulta(
                 params["codigoMunicipioIbge"] = str(municipio_ibge)
 
             req_count += 1
-            itens, err = _consulta_get_items(endpoint, params)
+            itens, err, meta = _consulta_get_items(endpoint, params)
             if err:
                 erros_consecutivos += 1
                 if erros_consecutivos >= CFG_CONSULTA_MAX_ERROS_CONSECUTIVOS:
@@ -564,8 +583,22 @@ def _consultar_pncp_api_consulta(
 
             erros_consecutivos = 0
             teve_resposta_consulta = True
+
+            if pagina == 1:
+                total_paginas = int(meta.get("totalPaginas") or 0)
+                if total_paginas > 1:
+                    # Busca páginas iniciais e finais para mitigar ordenação instável do serviço.
+                    max_extra = max(1, CFG_CONSULTA_MAX_PAGINAS_MODALIDADE - 1)
+                    for p in range(2, min(total_paginas, 1 + max_extra) + 1):
+                        if p not in paginas_visitadas:
+                            paginas_planejadas.append(p)
+                    inicio_finais = max(2, total_paginas - max_extra + 1)
+                    for p in range(total_paginas, inicio_finais - 1, -1):
+                        if p not in paginas_visitadas:
+                            paginas_planejadas.append(p)
+
             if not itens:
-                break
+                continue
 
             for item in itens:
                 unidade = item.get("unidadeOrgao") or {}
@@ -623,6 +656,7 @@ def _consultar_pncp_api_consulta(
                 numero_compra = str(item.get("numeroCompra") or "").strip()
                 modalidade_nome = str(item.get("modalidadeNome") or "").strip()
                 modo_disputa_nome = str(item.get("modoDisputaNome") or "").strip()
+                situacao_compra_nome = str(item.get("situacaoCompraNome") or "").strip()
                 objeto_compra = str(item.get("objetoCompra") or "").strip()
                 info_compl = str(item.get("informacaoComplementar") or "").strip()
 
@@ -651,9 +685,10 @@ def _consultar_pncp_api_consulta(
                         "description": objeto_compra or info_compl,
                         "document_type": tipo_inst,
                         "modalidade_licitacao_nome": modalidade_nome,
-                        "tipo_nome": modo_disputa_nome,
+                        "tipo_nome": _primeiro_valor(modo_disputa_nome, situacao_compra_nome),
                         "unidade_nome": str(unidade.get("nomeUnidade") or ""),
                         "esfera_nome": str(orgao.get("esferaId") or ""),
+                        "situacao_compra_nome": situacao_compra_nome,
                         "data_publicacao_pncp": data_pub_raw,
                         "data_fim_vigencia": data_enc,
                         "numeroProcesso": str(item.get("processo") or ""),
@@ -666,8 +701,8 @@ def _consultar_pncp_api_consulta(
                     }
                 )
 
-            if len(itens) < CFG_CONSULTA_TAM_PAGINA:
-                break
+            if len(itens) < CFG_CONSULTA_TAM_PAGINA and pagina != 1:
+                continue
         if limite_tempo_atingido or limite_req_atingido or abortar_por_erro:
             break
 

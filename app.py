@@ -1,7 +1,4 @@
-# app.py — versão com correções de comunicação PNCP
-
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import os
@@ -9,581 +6,562 @@ import io
 import re
 import json
 import time
-import base64
 import hashlib
+import unicodedata
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
 import streamlit as st
 
-# ==========================
-
-# Configuração de página
-
-# ==========================
+# =========================================================
+# CONFIG
+# =========================================================
 
 st.set_page_config(
-page_title="Acerte Licitações - O seu Buscador de Editais",
-page_icon="📑",
-layout="wide",
+    page_title="Acerte Licitações",
+    page_icon="📑",
+    layout="wide"
 )
 
-# ==========================
-
-# Constantes
-
-# ==========================
-
-BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE_DIR, "data")
-
-CSV_PNCP_PATHS = [
-os.path.join(DATA_DIR, "ListaMunicipiosPNCP.csv"),
-"ListaMunicipiosPNCP.csv",
-]
-
-ORIGIN = "[https://pncp.gov.br](https://pncp.gov.br)"
-BASE_API = "[https://pncp.gov.br/api/search/](https://pncp.gov.br/api/search/)"
+ORIGIN = "https://pncp.gov.br"
 
 HEADERS = {
-"User-Agent": (
-"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-"AppleWebKit/537.36 (KHTML, like Gecko) "
-"Chrome/124.0 Safari/537.36"
-),
-"Accept": "application/json, text/plain, */*",
-"Accept-Language": "pt-BR,pt;q=0.9",
-"Referer": "[https://pncp.gov.br/app/editais](https://pncp.gov.br/app/editais)",
-"Origin": "[https://pncp.gov.br](https://pncp.gov.br)",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124 Safari/537.36"
+    ),
+    "Accept": "application/json"
 }
 
-TAM_PAGINA_FIXO = 50
+BASE_DIR = os.path.dirname(__file__)
 
-STATUS_LABELS = [
-"A Receber/Recebendo Proposta",
-"Em Julgamento/Propostas Encerradas",
-"Encerradas",
-"Todos",
-]
+DATA_DIR = os.path.join(BASE_DIR, "data")
+
+CSV_PNCP = os.path.join(DATA_DIR, "ListaMunicipiosPNCP.csv")
 
 STATUS_MAP = {
-"A Receber/Recebendo Proposta": "recebendo_proposta",
-"Em Julgamento/Propostas Encerradas": "julgamento",
-"Encerradas": "encerrado",
-"Todos": "",
+    "A Receber": "recebendo_proposta",
+    "Em Julgamento": "em_julgamento",
+    "Encerradas": "encerrado",
+    "Todos": ""
 }
 
-# ==========================
+# =========================================================
+# HELPERS
+# =========================================================
 
-# Helpers
+def norm(txt: str) -> str:
 
-# ==========================
+    if not txt:
+        return ""
 
-def _norm(txt: str) -> str:
-if not txt:
-return ""
+    txt = str(txt)
 
-```
-import unicodedata
+    txt = unicodedata.normalize("NFKD", txt)
 
-txt = unicodedata.normalize("NFKD", str(txt))
-txt = txt.encode("ASCII", "ignore").decode("ASCII")
-txt = txt.lower().strip()
-return re.sub(r"\s+", " ", txt)
-```
+    txt = txt.encode("ascii", "ignore").decode("utf-8")
 
-def _fmt_dt_iso_to_br(valor: str) -> str:
-if not valor:
-return ""
+    txt = txt.lower().strip()
 
-```
-try:
-    valor = valor.replace("Z", "")
-    dt = datetime.fromisoformat(valor[:19])
-    return dt.strftime("%d/%m/%Y %H:%M")
-except Exception:
-    return valor
-```
+    return txt
 
-def _items_from_json(js) -> List[Dict]:
-if isinstance(js, list):
-return js
 
-```
-if not isinstance(js, dict):
-    return []
+def fmt_data(valor: str) -> str:
 
-for key in [
-    "items",
-    "results",
-    "content",
-    "data",
-    "resultados",
-    "licitacoes",
-]:
-    val = js.get(key)
-
-    if isinstance(val, list):
-        return val
-
-    if isinstance(val, dict):
-        for sub in ["items", "content", "data"]:
-            subval = val.get(sub)
-            if isinstance(subval, list):
-                return subval
-
-return []
-```
-
-def _build_pncp_link(item: Dict) -> str:
-cnpj = str(item.get("orgao_cnpj") or item.get("cnpj") or "").strip()
-ano = str(item.get("anoCompra") or item.get("ano") or "").strip()
-seq = str(item.get("sequencialCompra") or item.get("numero_sequencial") or "").strip()
-
-```
-if cnpj and ano and seq:
-    return f"https://pncp.gov.br/app/editais/{cnpj}/{ano}/{seq}"
-
-url = item.get("linkSistemaOrigem") or item.get("url") or ""
-
-if url.startswith("http"):
-    return url
-
-return ""
-```
-
-# ==========================
-
-# Loader CSV
-
-# ==========================
-
-@st.cache_data(show_spinner=False)
-def load_municipios_pncp() -> pd.DataFrame:
-encodings = ["utf-8", "utf-8-sig", "latin1", "cp1252"]
-
-```
-for path in CSV_PNCP_PATHS:
-    if not os.path.exists(path):
-        continue
-
-    for enc in encodings:
-        try:
-            df = pd.read_csv(
-                path,
-                sep=None,
-                engine="python",
-                dtype=str,
-                encoding=enc,
-                on_bad_lines="skip",
-            )
-
-            cols = {_norm(c): c for c in df.columns}
-
-            col_nome = (
-                cols.get("municipio")
-                or cols.get("nome")
-                or cols.get("municipios")
-            )
-
-            col_codigo = (
-                cols.get("id")
-                or cols.get("codigo")
-                or cols.get("codigo_pncp")
-            )
-
-            col_uf = cols.get("uf")
-
-            if not col_nome or not col_codigo:
-                continue
-
-            out = pd.DataFrame({
-                "nome": df[col_nome].astype(str).str.strip(),
-                "codigo_pncp": df[col_codigo].astype(str).str.strip(),
-            })
-
-            if col_uf:
-                out["uf"] = df[col_uf].astype(str).str.strip()
-            else:
-                out["uf"] = ""
-
-            out["nome_norm"] = out["nome"].map(_norm)
-
-            out = out.drop_duplicates(subset=["codigo_pncp"])
-
-            return out.reset_index(drop=True)
-
-        except Exception:
-            continue
-
-raise Exception("Não foi possível carregar ListaMunicipiosPNCP.csv")
-```
-
-# ==========================
-
-# CONSULTA PNCP CORRIGIDA
-
-# ==========================
-
-def consultar_pncp_por_municipio(
-municipio_id: str,
-status_value: str = "",
-tam_pagina: int = TAM_PAGINA_FIXO,
-) -> List[Dict]:
-
-```
-resultados = []
-
-session = requests.Session()
-
-pagina = 1
-
-while True:
-
-    params = {
-        "pagina": pagina,
-        "tamanhoPagina": tam_pagina,
-        "codigoMunicipioIbge": municipio_id,
-        "ordenacao": "-data",
-    }
-
-    if status_value:
-        params["status"] = status_value
+    if not valor:
+        return ""
 
     try:
+
+        dt = pd.to_datetime(valor)
+
+        return dt.strftime("%d/%m/%Y")
+
+    except Exception:
+
+        return valor
+
+
+def build_uid(row: Dict) -> str:
+
+    raw = (
+        str(row.get("titulo", ""))
+        + str(row.get("orgao", ""))
+        + str(row.get("data_publicacao", ""))
+    )
+
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+# =========================================================
+# CSV MUNICÍPIOS
+# =========================================================
+
+@st.cache_data
+def load_municipios() -> pd.DataFrame:
+
+    encodings = [
+        "utf-8",
+        "utf-8-sig",
+        "latin1",
+        "cp1252"
+    ]
+
+    separators = [
+        ",",
+        ";",
+        "\t",
+        "|"
+    ]
+
+    for enc in encodings:
+
+        for sep in separators:
+
+            try:
+
+                df = pd.read_csv(
+                    CSV_PNCP,
+                    dtype=str,
+                    encoding=enc,
+                    sep=sep,
+                    engine="python"
+                )
+
+                if len(df.columns) < 2:
+                    continue
+
+                cols = {norm(c): c for c in df.columns}
+
+                col_nome = None
+                col_codigo = None
+                col_uf = None
+
+                for key in cols:
+
+                    if key in ["municipio", "nome"]:
+                        col_nome = cols[key]
+
+                    if key in ["id", "codigo"]:
+                        col_codigo = cols[key]
+
+                    if key in ["uf", "estado"]:
+                        col_uf = cols[key]
+
+                if not col_nome or not col_codigo:
+                    continue
+
+                out = pd.DataFrame()
+
+                out["nome"] = df[col_nome].astype(str)
+
+                out["codigo"] = df[col_codigo].astype(str)
+
+                if col_uf:
+                    out["uf"] = df[col_uf].astype(str)
+                else:
+                    out["uf"] = ""
+
+                out["nome_norm"] = out["nome"].map(norm)
+
+                return out
+
+            except Exception:
+                continue
+
+    raise Exception("Falha ao carregar ListaMunicipiosPNCP.csv")
+
+
+# =========================================================
+# PNCP API
+# =========================================================
+
+def extract_items(js) -> List[Dict]:
+
+    if isinstance(js, list):
+        return js
+
+    if not isinstance(js, dict):
+        return []
+
+    keys = [
+        "items",
+        "data",
+        "resultados",
+        "content"
+    ]
+
+    for key in keys:
+
+        val = js.get(key)
+
+        if isinstance(val, list):
+            return val
+
+    return []
+
+
+def consultar_pncp(
+    codigo_municipio: str,
+    status: str
+) -> List[Dict]:
+
+    pagina = 1
+
+    resultados = []
+
+    session = requests.Session()
+
+    while True:
+
+        url = "https://pncp.gov.br/api/consulta/v1/contratacoes/publicacao"
+
+        params = {
+            "pagina": pagina,
+            "tamanhoPagina": 50,
+            "codigoMunicipioIbge": codigo_municipio
+        }
+
         r = session.get(
-            BASE_API,
+            url,
             params=params,
             headers=HEADERS,
-            timeout=30,
+            timeout=30
         )
 
         if r.status_code != 200:
             break
 
-        js = r.json()
+        try:
 
-        itens = _items_from_json(js)
+            js = r.json()
 
-        # fallback automático
-        if not itens:
+        except Exception:
+            break
 
-            fallback_url = "https://pncp.gov.br/api/consulta/v1/contratacoes/publicacao"
-
-            r2 = session.get(
-                fallback_url,
-                params={
-                    "codigoMunicipioIbge": municipio_id,
-                    "pagina": pagina,
-                    "tamanhoPagina": tam_pagina,
-                },
-                headers=HEADERS,
-                timeout=30,
-            )
-
-            if r2.status_code == 200:
-                itens = _items_from_json(r2.json())
+        itens = extract_items(js)
 
         if not itens:
             break
 
-        resultados.extend(itens)
+        for item in itens:
 
-        if len(itens) < tam_pagina:
+            situacao = str(
+                item.get("situacaoCompraNome", "")
+            ).lower()
+
+            if status:
+
+                if status not in situacao:
+                    continue
+
+            resultados.append(item)
+
+        if len(itens) < 50:
             break
 
         pagina += 1
 
-        time.sleep(0.08)
+        time.sleep(0.05)
 
-    except Exception as e:
-        print("ERRO PNCP:", e)
-        break
+    return resultados
 
-return resultados
-```
 
-# ==========================
+# =========================================================
+# TRANSFORMAÇÃO
+# =========================================================
 
-# Montagem de registro
+def montar_registro(item: Dict) -> Dict:
 
-# ==========================
-
-def montar_registro(item: Dict, municipio_codigo: str) -> Dict:
-
-```
-titulo = (
-    item.get("objetoCompra")
-    or item.get("titulo")
-    or item.get("objeto")
-    or ""
-)
-
-cidade = (
-    item.get("municipioNome")
-    or item.get("municipio_nome")
-    or ""
-)
-
-uf = (
-    item.get("ufSigla")
-    or item.get("uf")
-    or ""
-)
-
-orgao = (
-    item.get("orgaoEntidade", {}).get("razaoSocial")
-    or item.get("orgao_nome")
-    or ""
-)
-
-modalidade = (
-    item.get("modalidadeNome")
-    or item.get("modalidade_licitacao_nome")
-    or ""
-)
-
-pub = (
-    item.get("dataPublicacaoPncp")
-    or item.get("data_publicacao_pncp")
-    or ""
-)
-
-fim = (
-    item.get("dataEncerramentoProposta")
-    or item.get("fimRecebimentoProposta")
-    or ""
-)
-
-processo = (
-    item.get("numeroControlePNCP")
-    or item.get("numeroProcesso")
-    or ""
-)
-
-return {
-    "municipio_codigo": municipio_codigo,
-    "Cidade": cidade,
-    "UF": uf,
-    "Título": titulo,
-    "Objeto": titulo,
-    "Link para o edital": _build_pncp_link(item),
-    "Modalidade": modalidade,
-    "Orgão": orgao,
-    "Publicação": _fmt_dt_iso_to_br(pub),
-    "Fim do envio": _fmt_dt_iso_to_br(fim),
-    "Processo": processo,
-    "_pub_raw": pub,
-}
-```
-
-# ==========================
-
-# CACHE COLETA
-
-# ==========================
-
-@st.cache_data(ttl=600, show_spinner=False)
-def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
-
-```
-registros = []
-
-municipios = signature.get("municipios", [])
-status = signature.get("status", "")
-palavra = (signature.get("q") or "").strip().lower()
-
-for codigo in municipios:
-
-    itens = consultar_pncp_por_municipio(
-        municipio_id=codigo,
-        status_value=status,
+    titulo = (
+        item.get("objetoCompra")
+        or item.get("titulo")
+        or ""
     )
 
-    for item in itens:
-        registros.append(montar_registro(item, codigo))
-
-if not registros:
-    return pd.DataFrame()
-
-df = pd.DataFrame(registros)
-
-if palavra:
-    mask = (
-        df["Título"].fillna("").str.lower().str.contains(palavra)
-        |
-        df["Objeto"].fillna("").str.lower().str.contains(palavra)
+    orgao = (
+        item.get("orgaoEntidade", {})
+        .get("razaoSocial", "")
     )
 
-    df = df[mask]
+    municipio = (
+        item.get("unidadeOrgao", {})
+        .get("municipioNome", "")
+    )
 
-try:
-    df["_pub_dt"] = pd.to_datetime(df["_pub_raw"], errors="coerce")
-    df = df.sort_values("_pub_dt", ascending=False)
-except Exception:
-    pass
+    uf = (
+        item.get("unidadeOrgao", {})
+        .get("ufSigla", "")
+    )
 
-return df.reset_index(drop=True)
-```
+    modalidade = (
+        item.get("modalidadeNome", "")
+    )
 
-# ==========================
+    publicacao = (
+        item.get("dataPublicacaoPncp", "")
+    )
 
-# Estado sessão
+    encerramento = (
+        item.get("dataEncerramentoProposta", "")
+    )
 
-# ==========================
+    numero = (
+        item.get("numeroControlePNCP", "")
+    )
 
-def _ensure_session_state():
+    link = ""
 
-```
-if "selected_municipios" not in st.session_state:
-    st.session_state.selected_municipios = []
+    if numero:
 
-if "results_df" not in st.session_state:
-    st.session_state.results_df = None
+        link = (
+            f"https://pncp.gov.br/app/editais/{numero}"
+        )
 
-if "card_page" not in st.session_state:
-    st.session_state.card_page = 1
-```
+    return {
+        "titulo": titulo,
+        "orgao": orgao,
+        "municipio": municipio,
+        "uf": uf,
+        "modalidade": modalidade,
+        "data_publicacao": fmt_data(publicacao),
+        "encerramento": fmt_data(encerramento),
+        "link": link
+    }
 
-# ==========================
 
+# =========================================================
+# SESSION
+# =========================================================
+
+if "municipios" not in st.session_state:
+    st.session_state.municipios = []
+
+if "resultado" not in st.session_state:
+    st.session_state.resultado = None
+
+
+# =========================================================
 # MAIN
-
-# ==========================
+# =========================================================
 
 def main():
 
-```
-st.title("📑 Acerte Licitações")
+    st.title("📑 Acerte Licitações")
 
-_ensure_session_state()
+    st.sidebar.header("Filtros")
 
-try:
-    pncp_df = load_municipios_pncp()
-except Exception as e:
-    st.error(f"Erro ao carregar CSV: {e}")
-    st.stop()
+    municipios_df = load_municipios()
 
-st.sidebar.header("Filtros")
+    palavra = st.sidebar.text_input(
+        "Palavra-chave"
+    )
 
-ufs = sorted([
-    x for x in pncp_df["uf"].dropna().unique().tolist()
-    if x
-])
+    status_label = st.sidebar.selectbox(
+        "Status",
+        list(STATUS_MAP.keys())
+    )
 
-uf = st.sidebar.selectbox("UF", ["Selecione"] + ufs)
+    ufs = sorted(
+        municipios_df["uf"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
 
-municipios = []
+    uf = st.sidebar.selectbox(
+        "UF",
+        ["Selecione"] + ufs
+    )
 
-if uf != "Selecione":
+    if uf != "Selecione":
 
-    temp = pncp_df[pncp_df["uf"] == uf]
+        mun_df = municipios_df[
+            municipios_df["uf"] == uf
+        ]
 
-    municipios = sorted(temp["nome"].tolist())
+        labels = sorted(
+            mun_df["nome"].tolist()
+        )
 
-municipio = st.sidebar.selectbox(
-    "Município",
-    ["Selecione"] + municipios,
-)
+        municipio_nome = st.sidebar.selectbox(
+            "Município",
+            ["Selecione"] + labels
+        )
 
-if st.sidebar.button("Adicionar município"):
+        if st.sidebar.button("Adicionar"):
 
-    if municipio != "Selecione":
+            if municipio_nome != "Selecione":
 
-        row = pncp_df[
-            pncp_df["nome"] == municipio
-        ].iloc[0]
+                row = mun_df[
+                    mun_df["nome"] == municipio_nome
+                ].iloc[0]
 
-        codigo = row["codigo_pncp"]
+                codigo = row["codigo"]
 
-        ja = [x["codigo_pncp"] for x in st.session_state.selected_municipios]
+                ja = any(
+                    m["codigo"] == codigo
+                    for m in st.session_state.municipios
+                )
 
-        if codigo not in ja:
-            st.session_state.selected_municipios.append({
-                "codigo_pncp": codigo,
-                "nome": municipio,
-                "uf": uf,
-            })
+                if not ja:
 
-st.sidebar.markdown("---")
+                    st.session_state.municipios.append({
+                        "nome": municipio_nome,
+                        "codigo": codigo,
+                        "uf": uf
+                    })
 
-st.sidebar.markdown("### Municípios selecionados")
+    st.sidebar.markdown("---")
 
-for m in st.session_state.selected_municipios:
-    st.sidebar.write(f"• {m['nome']} / {m['uf']}")
+    st.sidebar.markdown("### Municípios")
 
-palavra = st.sidebar.text_input("Palavra-chave")
+    remover = None
 
-status_label = st.sidebar.radio(
-    "Status",
-    STATUS_LABELS,
-)
+    for i, m in enumerate(st.session_state.municipios):
 
-pesquisar = st.sidebar.button(
-    "🔎 Pesquisar",
-    use_container_width=True,
-)
+        col1, col2 = st.sidebar.columns([5,1])
 
-if not pesquisar:
-    st.info("Configure os filtros e clique em Pesquisar.")
-    return
+        with col1:
+            st.write(f"{m['nome']} / {m['uf']}")
 
-if not st.session_state.selected_municipios:
-    st.warning("Selecione ao menos um município.")
-    return
+        with col2:
 
-signature = {
-    "municipios": [
-        x["codigo_pncp"]
-        for x in st.session_state.selected_municipios
-    ],
-    "status": STATUS_MAP.get(status_label, ""),
-    "q": palavra,
-}
+            if st.button("X", key=f"rm_{i}"):
 
-with st.spinner("Consultando PNCP..."):
-    df = coletar_por_assinatura(signature)
+                remover = i
 
-if df.empty:
-    st.warning("Nenhum edital encontrado.")
-    return
+    if remover is not None:
 
-st.success(f"{len(df)} editais encontrados")
+        st.session_state.municipios.pop(remover)
 
-for _, row in df.iterrows():
+        st.rerun()
 
-    st.markdown(f"""
-    ### {row['Título']}
+    pesquisar = st.sidebar.button(
+        "Pesquisar",
+        type="primary",
+        use_container_width=True
+    )
 
-    **Cidade:** {row['Cidade']} / {row['UF']}  
-    **Órgão:** {row['Orgão']}  
-    **Modalidade:** {row['Modalidade']}  
-    **Publicação:** {row['Publicação']}  
-    **Fim envio:** {row['Fim do envio']}  
-    **Processo:** {row['Processo']}  
+    if pesquisar:
 
-    [Abrir edital]({row['Link para o edital']})
+        registros = []
 
-    ---
-    """)
+        status_api = STATUS_MAP[status_label]
 
-# EXPORTAÇÃO
-xlsx = io.BytesIO()
+        with st.spinner("Consultando PNCP..."):
 
-with pd.ExcelWriter(xlsx, engine="openpyxl") as writer:
-    df.to_excel(writer, index=False)
+            for mun in st.session_state.municipios:
 
-st.download_button(
-    "⬇️ Baixar XLSX",
-    data=xlsx.getvalue(),
-    file_name=f"pncp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
-```
+                itens = consultar_pncp(
+                    mun["codigo"],
+                    status_api
+                )
 
-if **name** == "**main**":
-main()
+                for item in itens:
 
+                    reg = montar_registro(item)
+
+                    registros.append(reg)
+
+        df = pd.DataFrame(registros)
+
+        if not df.empty and palavra:
+
+            mask = (
+                df["titulo"]
+                .fillna("")
+                .str.contains(
+                    palavra,
+                    case=False,
+                    na=False
+                )
+            )
+
+            df = df[mask]
+
+        st.session_state.resultado = df
+
+    df = st.session_state.resultado
+
+    if df is None:
+
+        st.info("Selecione os filtros e clique em Pesquisar.")
+
+        return
+
+    st.subheader(f"Resultados ({len(df)})")
+
+    if df.empty:
+
+        st.warning("Nenhum resultado encontrado.")
+
+        return
+
+    for _, row in df.iterrows():
+
+        st.markdown("---")
+
+        st.markdown(
+            f"## {row['titulo']}"
+        )
+
+        st.write(
+            f"**Órgão:** {row['orgao']}"
+        )
+
+        st.write(
+            f"**Cidade:** {row['municipio']} / {row['uf']}"
+        )
+
+        st.write(
+            f"**Modalidade:** {row['modalidade']}"
+        )
+
+        st.write(
+            f"**Publicação:** {row['data_publicacao']}"
+        )
+
+        st.write(
+            f"**Encerramento:** {row['encerramento']}"
+        )
+
+        if row["link"]:
+
+            st.link_button(
+                "Abrir edital",
+                row["link"]
+            )
+
+    st.markdown("---")
+
+    xlsx = io.BytesIO()
+
+    with pd.ExcelWriter(
+        xlsx,
+        engine="openpyxl"
+    ) as writer:
+
+        df.to_excel(
+            writer,
+            index=False
+        )
+
+    st.download_button(
+        "Baixar XLSX",
+        data=xlsx.getvalue(),
+        file_name="licitacoes.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-"
+            "officedocument.spreadsheetml.sheet"
+        ),
+        use_container_width=True
+    )
+
+
+if __name__ == "__main__":
+
+    main()

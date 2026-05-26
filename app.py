@@ -45,9 +45,15 @@ SAVED_NA_PATH = os.path.join(BASE_DIR, "na_marks.json")
 ORIGIN = "https://pncp.gov.br"
 BASE_API = ORIGIN + "/api/search"
 HEADERS = {
-    "User-Agent": "AcerteLicitacoes/1.1 (+streamlit)",
-    "Referer": "https://pncp.gov.br/app/editais",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "pt-BR,pt;q=0.9",
+    "Referer": "https://pncp.gov.br/app/editais",
+    "Origin": "https://pncp.gov.br",
 }
 TAM_PAGINA_FIXO = 100  # coleta sempre com 100 por página
 
@@ -85,16 +91,43 @@ def _items_from_json(js) -> List[Dict]:
         return js
     return []
 
-def _fmt_dt_iso_to_br(dt: str) -> str:
-    if not dt:
-        return ""
-    try:
-        ts = pd.to_datetime(dt, errors="coerce", utc=False)
-        if pd.isna(ts):
-            return ""
-        return ts.strftime("%d/%m/%Y %H:%M")
-    except Exception:
-        return ""
+def _items_from_json(js) -> List[Dict]:
+
+    if isinstance(js, list):
+        return js
+
+    if not isinstance(js, dict):
+        return []
+
+    candidatos = [
+        js.get("items"),
+        js.get("results"),
+        js.get("content"),
+        js.get("conteudo"),
+        js.get("data"),
+        js.get("resultados"),
+    ]
+
+    for c in candidatos:
+
+        if isinstance(c, list):
+            return c
+
+        if isinstance(c, dict):
+
+            for subkey in [
+                "items",
+                "results",
+                "content",
+                "conteudo",
+            ]:
+
+                sub = c.get(subkey)
+
+                if isinstance(sub, list):
+                    return sub
+
+    return []
 
 def _full_url(item_url: str) -> str:
     if not item_url:
@@ -327,78 +360,207 @@ def consultar_pncp_por_municipio(
     tam_pagina: int = TAM_PAGINA_FIXO,
     delay_s: float = 0.05,
 ) -> List[Dict]:
+
     out: List[Dict] = []
     pagina = 1
-    while True:
-        params = {
-            "tipos_documento": "edital",
-            "ordenacao": "-data",
-            "pagina": pagina,
-            "tam_pagina": tam_pagina,
-            "municipios": municipio_id,
-        }
-        if status_value:
-            params["status"] = status_value
 
-        r = requests.get(BASE_API, params=params, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        js = r.json()
-        itens = _items_from_json(js)
+    session = requests.Session()
+
+    while True:
+
+        itens = []
+
+        params_variacoes = [
+            {
+                "tipos_documento": "edital",
+                "ordenacao": "-data",
+                "pagina": pagina,
+                "tam_pagina": tam_pagina,
+                "municipios": municipio_id,
+                "status": status_value,
+            },
+            {
+                "tiposDocumento": "edital",
+                "ordenacao": "-data",
+                "pagina": pagina,
+                "tamanhoPagina": tam_pagina,
+                "municipios": municipio_id,
+                "status": status_value,
+            },
+            {
+                "tiposDocumento": "edital",
+                "ordenacao": "-dataPublicacaoPncp",
+                "pagina": pagina,
+                "tamanhoPagina": tam_pagina,
+                "codigoMunicipioIbge": municipio_id,
+                "status": status_value,
+            },
+        ]
+
+        for params in params_variacoes:
+
+            try:
+
+                r = session.get(
+                    BASE_API,
+                    params=params,
+                    headers=HEADERS,
+                    timeout=30,
+                )
+
+                if r.status_code != 200:
+                    continue
+
+                js = r.json()
+
+                itens = _items_from_json(js)
+
+                if itens:
+                    break
+
+            except Exception as e:
+                print("ERRO API SEARCH:", e)
+
+        if not itens:
+
+            try:
+
+                data_final = datetime.now().strftime("%Y%m%d")
+                data_inicial = "20240101"
+
+                modalidades = list(range(1, 15))
+
+                for modalidade in modalidades:
+
+                    url = (
+                        "https://pncp.gov.br/api/consulta/v1/"
+                        "contratacoes/publicacao"
+                    )
+
+                    params = {
+                        "dataInicial": data_inicial,
+                        "dataFinal": data_final,
+                        "codigoModalidadeContratacao": modalidade,
+                        "codigoMunicipioIbge": municipio_id,
+                        "pagina": pagina,
+                        "tamanhoPagina": tam_pagina,
+                    }
+
+                    r = session.get(
+                        url,
+                        params=params,
+                        headers=HEADERS,
+                        timeout=30,
+                    )
+
+                    if r.status_code != 200:
+                        continue
+
+                    js = r.json()
+
+                    encontrados = _items_from_json(js)
+
+                    if encontrados:
+                        itens.extend(encontrados)
+
+            except Exception as e:
+                print("ERRO API OFICIAL:", e)
 
         if not itens:
             break
 
         out.extend(itens)
+
         if len(itens) < tam_pagina:
             break
 
         pagina += 1
+
         time.sleep(delay_s)
+
     return out
 
 def montar_registro(item: Dict, municipio_codigo: str) -> Dict:
-    pub_raw = item.get("data_publicacao_pncp") or item.get("data") or item.get("dataPublicacao") or ""
-    fim_raw = item.get("data_fim_vigencia") or item.get("fimEnvioProposta") or ""
+
+    orgao = (
+        item.get("orgao_nome")
+        or item.get("orgao")
+        or item.get("orgaoEntidade", {}).get("razaoSocial")
+        or ""
+    )
+
+    unidade = (
+        item.get("unidade_nome")
+        or item.get("unidadeOrgao", {}).get("nomeUnidade")
+        or ""
+    )
+
+    cidade = (
+        item.get("municipio_nome")
+        or item.get("unidadeOrgao", {}).get("municipioNome")
+        or ""
+    )
+
+    uf = (
+        item.get("uf")
+        or item.get("unidadeOrgao", {}).get("ufSigla")
+        or ""
+    )
+
+    titulo = (
+        item.get("title")
+        or item.get("titulo")
+        or item.get("objetoCompra")
+        or item.get("objetoContrato")
+        or ""
+    )
+
+    modalidade = (
+        item.get("modalidade_licitacao_nome")
+        or item.get("modalidadeNome")
+        or ""
+    )
+
+    pub_raw = (
+        item.get("data_publicacao_pncp")
+        or item.get("dataPublicacaoPncp")
+        or item.get("data")
+        or ""
+    )
+
+    fim_raw = (
+        item.get("data_fim_vigencia")
+        or item.get("fimEnvioProposta")
+        or ""
+    )
 
     processo = _primeiro_valor(
         item.get("numeroProcesso"),
         item.get("processo"),
         item.get("numero_processo"),
-        item.get("numeroProcessoLicitatorio"),
-        item.get("numero_processo_licitatorio"),
-        item.get("processoLicitatorio"),
-        item.get("numProcesso"),
-        item.get("processNumber"),
-        item.get("numero_processo_adm"),
-        item.get("numeroProcessoAdministrativo"),
     )
-
-    orgao_cnpj = str(item.get("orgao_cnpj") or "").strip()
-    ano = str(item.get("ano") or "").strip()
-    seq = str(item.get("numero_sequencial") or "").strip()
-    raw_id = str(item.get("id") or item.get("uuid") or "")
 
     return {
         "municipio_codigo": municipio_codigo,
-        "Cidade": item.get("municipio_nome", ""),
-        "UF": item.get("uf", ""),
-        "Título": item.get("title", "") or item.get("titulo", ""),
-        "Objeto": item.get("description", "") or item.get("objeto", ""),
+        "Cidade": cidade,
+        "UF": uf,
+        "Título": titulo,
+        "Objeto": titulo,
         "Link para o edital": _build_pncp_link(item),
-        "Modalidade": item.get("modalidade_licitacao_nome", ""),
+        "Modalidade": modalidade,
         "Tipo": item.get("tipo_nome", ""),
         "Tipo (documento)": item.get("document_type", ""),
-        "Orgão": item.get("orgao_nome", "") or item.get("orgao", ""),
-        "Unidade": item.get("unidade_nome", ""),
+        "Orgão": orgao,
+        "Unidade": unidade,
         "Esfera": item.get("esfera_nome", ""),
         "Publicação": _fmt_dt_iso_to_br(pub_raw),
         "Fim do envio de proposta": _fmt_dt_iso_to_br(fim_raw),
         "numero_processo": str(processo or "").strip(),
         "_pub_raw": pub_raw,
-        "_orgao_cnpj": orgao_cnpj,
-        "_ano": ano,
-        "_seq": seq,
-        "_id": raw_id,
+        "_orgao_cnpj": "",
+        "_ano": "",
+        "_seq": "",
+        "_id": str(item.get("id") or ""),
     }
 
 # ==========================

@@ -59,7 +59,11 @@ HEADERS = {
 TAM_PAGINA_FIXO = 100
 CONSULTA_TAM_PAGINA = 100
 CONSULTA_MAX_PAGINAS_MODALIDADE = 3
-CONSULTA_DIAS_PUBLICACAO = 45
+CONSULTA_DIAS_PUBLICACAO = 365
+CONSULTA_TIMEOUT_HTTP = 12
+CONSULTA_MAX_REQUISICOES_MUNICIPIO = 120
+CONSULTA_MAX_SEGUNDOS_MUNICIPIO = 40
+CONSULTA_MAX_ERROS_CONSECUTIVOS = 4
 ANOS_LOOKBACK = 1
 MAX_SEQ_SCAN = 180
 MISS_STREAK_STOP = 40
@@ -98,6 +102,25 @@ CFG_MAX_ORGAOS_POR_MUNICIPIO = _secret_int("PNCP_MAX_ORGAOS_POR_MUNICIPIO", MAX_
 CFG_CONSULTA_TAM_PAGINA = min(500, _secret_int("PNCP_CONSULTA_TAM_PAGINA", CONSULTA_TAM_PAGINA))
 CFG_CONSULTA_MAX_PAGINAS_MODALIDADE = _secret_int("PNCP_CONSULTA_MAX_PAGINAS_MODALIDADE", CONSULTA_MAX_PAGINAS_MODALIDADE)
 CFG_CONSULTA_DIAS_PUBLICACAO = _secret_int("PNCP_CONSULTA_DIAS_PUBLICACAO", CONSULTA_DIAS_PUBLICACAO)
+CFG_CONSULTA_TIMEOUT_HTTP = _secret_int("PNCP_CONSULTA_TIMEOUT_HTTP", CONSULTA_TIMEOUT_HTTP)
+CFG_CONSULTA_MAX_REQUISICOES_MUNICIPIO = _secret_int(
+    "PNCP_CONSULTA_MAX_REQUISICOES_MUNICIPIO",
+    CONSULTA_MAX_REQUISICOES_MUNICIPIO,
+)
+CFG_CONSULTA_MAX_SEGUNDOS_MUNICIPIO = _secret_int(
+    "PNCP_CONSULTA_MAX_SEGUNDOS_MUNICIPIO",
+    CONSULTA_MAX_SEGUNDOS_MUNICIPIO,
+)
+CFG_CONSULTA_MAX_ERROS_CONSECUTIVOS = _secret_int(
+    "PNCP_CONSULTA_MAX_ERROS_CONSECUTIVOS",
+    CONSULTA_MAX_ERROS_CONSECUTIVOS,
+)
+CFG_ENABLE_FALLBACK_SCAN = str(st.secrets.get("PNCP_ENABLE_FALLBACK_SCAN", "false")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _norm(s: str) -> str:
@@ -405,7 +428,7 @@ def _listar_modalidades_ids() -> List[int]:
                     ids.append(v)
             except Exception:
                 continue
-    ids = sorted(set(ids))
+    ids = sorted({x for x in ids if 1 <= int(x) <= 13})
     return ids if ids else MODALIDADES_PADRAO
 
 
@@ -426,13 +449,21 @@ def _status_compativel_consulta(status_value: str, situacao_id: Optional[int], d
     is_fechada_data = bool(pd.notna(fim) and fim < agora)
 
     if status_value == "recebendo_proposta":
-        return bool(pd.notna(fim) and fim >= agora)
+        # Manual 6.4: propostas em aberto.
+        # Regras práticas: situação divulgada (1) e fim de recebimento >= agora.
+        if pd.isna(fim):
+            return False
+        if situacao_id is not None and int(situacao_id) != 1:
+            return False
+        return bool(fim >= agora)
 
     if status_value == "em_julgamento":
+        # Não existe status explícito "em julgamento" no domínio da contratação.
+        # Aproximação: já encerrou proposta, mas contratação segue divulgada (1).
         return situacao_id == 1 and is_fechada_data
 
     if status_value == "encerrado":
-        if situacao_id in {2, 3, 4}:
+        if situacao_id in {2, 3, 4}:  # revogada/anulada/suspensa
             return True
         return is_fechada_data and situacao_id not in {1}
 
@@ -441,7 +472,7 @@ def _status_compativel_consulta(status_value: str, situacao_id: Optional[int], d
 
 def _consulta_get_items(url: str, params: Dict) -> Tuple[List[Dict], Optional[str]]:
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=35)
+        r = requests.get(url, params=params, headers=HEADERS, timeout=CFG_CONSULTA_TIMEOUT_HTTP)
     except Exception as e:
         return [], f"request_error:{e}"
 
@@ -474,6 +505,7 @@ def _consultar_pncp_api_consulta(
     modalidades = _listar_modalidades_ids()
     data_final = datetime.now().strftime("%Y%m%d")
     data_inicial = (datetime.now() - timedelta(days=CFG_CONSULTA_DIAS_PUBLICACAO)).strftime("%Y%m%d")
+    dt_inicial = pd.Timestamp(datetime.now() - timedelta(days=CFG_CONSULTA_DIAS_PUBLICACAO))
 
     endpoint = BASE_API_CONSULTA_PUBLICACAO
     endpoint_is_proposta = False
@@ -485,9 +517,28 @@ def _consultar_pncp_api_consulta(
     resultados: List[Dict] = []
     vistos = set()
     teve_resposta_consulta = False
+    req_count = 0
+    erros_consecutivos = 0
+    t0 = time.monotonic()
+    limite_tempo_atingido = False
+    limite_req_atingido = False
+    abortar_por_erro = False
 
     for modalidade_id in modalidades:
+        if (time.monotonic() - t0) >= CFG_CONSULTA_MAX_SEGUNDOS_MUNICIPIO:
+            limite_tempo_atingido = True
+            break
+        if req_count >= CFG_CONSULTA_MAX_REQUISICOES_MUNICIPIO:
+            limite_req_atingido = True
+            break
         for pagina in range(1, CFG_CONSULTA_MAX_PAGINAS_MODALIDADE + 1):
+            if (time.monotonic() - t0) >= CFG_CONSULTA_MAX_SEGUNDOS_MUNICIPIO:
+                limite_tempo_atingido = True
+                break
+            if req_count >= CFG_CONSULTA_MAX_REQUISICOES_MUNICIPIO:
+                limite_req_atingido = True
+                break
+
             params: Dict[str, str | int] = {
                 "codigoModalidadeContratacao": modalidade_id,
                 "pagina": pagina,
@@ -503,9 +554,15 @@ def _consultar_pncp_api_consulta(
             if municipio_ibge:
                 params["codigoMunicipioIbge"] = str(municipio_ibge)
 
+            req_count += 1
             itens, err = _consulta_get_items(endpoint, params)
             if err:
+                erros_consecutivos += 1
+                if erros_consecutivos >= CFG_CONSULTA_MAX_ERROS_CONSECUTIVOS:
+                    abortar_por_erro = True
                 break
+
+            erros_consecutivos = 0
             teve_resposta_consulta = True
             if not itens:
                 break
@@ -533,9 +590,20 @@ def _consultar_pncp_api_consulta(
                 except Exception:
                     sit_id = None
                 data_enc = str(item.get("dataEncerramentoProposta") or "")
+                data_pub_raw = _primeiro_valor(
+                    item.get("dataPublicacaoPncp"),
+                    item.get("dataAtualizacao"),
+                    item.get("dataInclusao"),
+                )
+                dt_pub = pd.to_datetime(data_pub_raw, errors="coerce", utc=True)
+                if pd.notna(dt_pub):
+                    dt_pub = dt_pub.tz_localize(None)
 
-                # Para "recebendo proposta", o endpoint /proposta já filtra.
-                if not endpoint_is_proposta and not _status_compativel_consulta(status_value, sit_id, data_enc):
+                # Segurança adicional: mantém janela de publicação para todos os status.
+                if pd.notna(dt_pub) and dt_pub < dt_inicial:
+                    continue
+
+                if not _status_compativel_consulta(status_value, sit_id, data_enc):
                     continue
 
                 numero_controle = str(item.get("numeroControlePNCP") or "")
@@ -553,13 +621,22 @@ def _consultar_pncp_api_consulta(
 
                 tipo_inst = str(item.get("tipoInstrumentoConvocatorioNome") or "").strip()
                 numero_compra = str(item.get("numeroCompra") or "").strip()
-                titulo = _primeiro_valor(
-                    item.get("titulo"),
-                    item.get("title"),
-                    f"{tipo_inst} nº {numero_compra}".strip(),
-                    numero_controle,
-                    "Edital",
-                )
+                modalidade_nome = str(item.get("modalidadeNome") or "").strip()
+                modo_disputa_nome = str(item.get("modoDisputaNome") or "").strip()
+                objeto_compra = str(item.get("objetoCompra") or "").strip()
+                info_compl = str(item.get("informacaoComplementar") or "").strip()
+
+                if numero_compra and ano:
+                    titulo = f"{tipo_inst or 'Contratação'} nº {numero_compra}/{ano}".strip()
+                elif numero_compra:
+                    titulo = f"{tipo_inst or 'Contratação'} nº {numero_compra}".strip()
+                else:
+                    titulo = _primeiro_valor(
+                        item.get("titulo"),
+                        item.get("title"),
+                        numero_controle,
+                        "Contratação",
+                    )
 
                 resultados.append(
                     {
@@ -571,23 +648,31 @@ def _consultar_pncp_api_consulta(
                         "ano": ano,
                         "numero_sequencial": seq,
                         "title": titulo,
-                        "description": _primeiro_valor(item.get("objetoCompra"), item.get("informacaoComplementar"), ""),
+                        "description": objeto_compra or info_compl,
                         "document_type": tipo_inst,
-                        "modalidade_licitacao_nome": str(item.get("modalidadeNome") or ""),
-                        "data_publicacao_pncp": _primeiro_valor(
-                            item.get("dataPublicacaoPncp"),
-                            item.get("dataAtualizacao"),
-                            item.get("dataInclusao"),
-                        ),
+                        "modalidade_licitacao_nome": modalidade_nome,
+                        "tipo_nome": modo_disputa_nome,
+                        "unidade_nome": str(unidade.get("nomeUnidade") or ""),
+                        "esfera_nome": str(orgao.get("esferaId") or ""),
+                        "data_publicacao_pncp": data_pub_raw,
                         "data_fim_vigencia": data_enc,
                         "numeroProcesso": str(item.get("processo") or ""),
-                        "item_url": f"/app/editais/{cnpj}/{ano}/{seq}" if cnpj and ano and seq else "",
+                        "item_url": _primeiro_valor(
+                            f"/app/editais/{cnpj}/{ano}/{seq}" if cnpj and ano and seq else "",
+                            item.get("linkSistemaOrigem"),
+                            "",
+                        ),
                         "id": uid or numero_controle,
                     }
                 )
 
             if len(itens) < CFG_CONSULTA_TAM_PAGINA:
                 break
+        if limite_tempo_atingido or limite_req_atingido or abortar_por_erro:
+            break
+
+    if abortar_por_erro and not resultados:
+        raise RuntimeError("API de Consultas com erro recorrente")
 
     if not teve_resposta_consulta and not resultados:
         raise RuntimeError("API de Consultas indisponível ou não-JSON")
@@ -608,7 +693,7 @@ def _buscar_orgaos_por_municipio_nome(municipio_nome: str) -> List[Dict]:
                 BASE_API_ORGAOS,
                 params={"razaoSocial": nome, "pagina": pagina},
                 headers=HEADERS,
-                timeout=30,
+                timeout=CFG_CONSULTA_TIMEOUT_HTTP,
             )
             r.raise_for_status()
             js = r.json()
@@ -665,7 +750,7 @@ def _buscar_orgaos_por_municipio_nome(municipio_nome: str) -> List[Dict]:
 @st.cache_data(ttl=1800, show_spinner=False)
 def _listar_arquivos_compra(cnpj: str, ano: int, seq: int) -> List[Dict]:
     url = BASE_API_ARQUIVOS.format(cnpj=cnpj, ano=ano, seq=seq)
-    r = requests.get(url, headers=HEADERS, timeout=30)
+    r = requests.get(url, headers=HEADERS, timeout=CFG_CONSULTA_TIMEOUT_HTTP)
     if r.status_code == 404:
         return []
     r.raise_for_status()
@@ -676,7 +761,12 @@ def _listar_arquivos_compra(cnpj: str, ano: int, seq: int) -> List[Dict]:
 @st.cache_data(ttl=1800, show_spinner=False)
 def _primeiro_item_compra(cnpj: str, ano: int, seq: int) -> Dict:
     url = BASE_API_ITENS.format(cnpj=cnpj, ano=ano, seq=seq)
-    r = requests.get(url, params={"pagina": 1, "tamanhoPagina": 1}, headers=HEADERS, timeout=30)
+    r = requests.get(
+        url,
+        params={"pagina": 1, "tamanhoPagina": 1},
+        headers=HEADERS,
+        timeout=CFG_CONSULTA_TIMEOUT_HTTP,
+    )
     if r.status_code == 404:
         return {}
     r.raise_for_status()
@@ -718,17 +808,33 @@ def _consultar_pncp_por_municipio_scan(
     vistos = set()
     orgaos = _buscar_orgaos_por_municipio_nome(municipio_nome)
     anos = [datetime.now().year - i for i in range(CFG_ANOS_LOOKBACK + 1)]
+    t0 = time.monotonic()
+    req_count = 0
+    max_seq_scan = min(CFG_MAX_SEQ_SCAN, 80)
 
     for org in orgaos:
+        if (time.monotonic() - t0) >= CFG_CONSULTA_MAX_SEGUNDOS_MUNICIPIO:
+            break
+        if req_count >= CFG_CONSULTA_MAX_REQUISICOES_MUNICIPIO:
+            break
         cnpj = str(org.get("cnpj") or "").strip()
         orgao_nome = str(org.get("razao") or "").strip()
         if len(cnpj) != 14:
             continue
 
         for ano in anos:
+            if (time.monotonic() - t0) >= CFG_CONSULTA_MAX_SEGUNDOS_MUNICIPIO:
+                break
+            if req_count >= CFG_CONSULTA_MAX_REQUISICOES_MUNICIPIO:
+                break
             misses = 0
-            for seq in range(1, CFG_MAX_SEQ_SCAN + 1):
+            for seq in range(1, max_seq_scan + 1):
+                if (time.monotonic() - t0) >= CFG_CONSULTA_MAX_SEGUNDOS_MUNICIPIO:
+                    break
+                if req_count >= CFG_CONSULTA_MAX_REQUISICOES_MUNICIPIO:
+                    break
                 try:
+                    req_count += 1
                     arqs = _listar_arquivos_compra(cnpj, ano, seq)
                 except Exception:
                     misses += 1
@@ -757,6 +863,9 @@ def _consultar_pncp_por_municipio_scan(
 
                 item0 = {}
                 try:
+                    if req_count >= CFG_CONSULTA_MAX_REQUISICOES_MUNICIPIO:
+                        break
+                    req_count += 1
                     item0 = _primeiro_item_compra(cnpj, ano, seq)
                 except Exception:
                     item0 = {}
@@ -811,6 +920,8 @@ def consultar_pncp_por_municipio(
             status_value=status_value,
         )
     except Exception:
+        if not CFG_ENABLE_FALLBACK_SCAN:
+            return []
         # 2) Fallback: endpoints do manual de integração (/pncp-api/v1/orgaos/...)
         return _consultar_pncp_por_municipio_scan(
             municipio_id=municipio_id,
@@ -1410,4 +1521,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+
+

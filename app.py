@@ -74,24 +74,11 @@ UF_PLACEHOLDER = "— Selecione a UF —"
 # ==========================
 # Utilitários
 # ==========================
-def _norm(s: str) -> str:
-    s = str(s or "").strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    return s.strip("_")
-
 def _items_from_json(js) -> List[Dict]:
-    if isinstance(js, dict):
-        for k in ["items", "results", "conteudo", "licitacoes", "data", "documents", "documentos", "content", "resultados"]:
-            v = js.get(k)
-            if isinstance(v, list):
-                return v
-    if isinstance(js, list):
-        return js
-    return []
-
-def _items_from_json(js) -> List[Dict]:
+    """
+    Extrai listas de itens independentemente do formato
+    retornado pela API do PNCP.
+    """
 
     if isinstance(js, list):
         return js
@@ -99,33 +86,35 @@ def _items_from_json(js) -> List[Dict]:
     if not isinstance(js, dict):
         return []
 
-    candidatos = [
-        js.get("items"),
-        js.get("results"),
-        js.get("content"),
-        js.get("conteudo"),
-        js.get("data"),
-        js.get("resultados"),
+    # chaves diretas mais comuns
+    direct_keys = [
+        "items",
+        "results",
+        "content",
+        "conteudo",
+        "data",
+        "resultados",
+        "licitacoes",
+        "documents",
+        "documentos",
     ]
 
-    for c in candidatos:
+    for key in direct_keys:
 
-        if isinstance(c, list):
-            return c
+        value = js.get(key)
 
-        if isinstance(c, dict):
+        if isinstance(value, list):
+            return value
 
-            for subkey in [
-                "items",
-                "results",
-                "content",
-                "conteudo",
-            ]:
+        # casos aninhados
+        if isinstance(value, dict):
 
-                sub = c.get(subkey)
+            for subkey in direct_keys:
 
-                if isinstance(sub, list):
-                    return sub
+                subvalue = value.get(subkey)
+
+                if isinstance(subvalue, list):
+                    return subvalue
 
     return []
 

@@ -9,7 +9,7 @@ import time
 import base64
 import unicodedata
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -43,14 +43,28 @@ SAVED_TR_PATH = os.path.join(BASE_DIR, "tr_marks.json")
 SAVED_NA_PATH = os.path.join(BASE_DIR, "na_marks.json")
 
 ORIGIN = "https://pncp.gov.br"
-BASE_API = ORIGIN + "/api/search"
+BASE_API_CONSULTA = ORIGIN + "/api/consulta/v1"
+BASE_API_CONSULTA_PUBLICACAO = BASE_API_CONSULTA + "/contratacoes/publicacao"
+BASE_API_CONSULTA_PROPOSTA = BASE_API_CONSULTA + "/contratacoes/proposta"
+BASE_API_ORGAOS = ORIGIN + "/pncp-api/v1/orgaos/"
+BASE_API_ARQUIVOS = ORIGIN + "/pncp-api/v1/orgaos/{cnpj}/compras/{ano}/{seq}/arquivos"
+BASE_API_ITENS = ORIGIN + "/pncp-api/v1/orgaos/{cnpj}/compras/{ano}/{seq}/itens"
+BASE_API_MODALIDADES = ORIGIN + "/pncp-api/v1/modalidades"
 HEADERS = {
-    "User-Agent": "AcerteLicitacoes/1.1 (+streamlit)",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Referer": "https://pncp.gov.br/app/editais",
     "Accept-Language": "pt-BR,pt;q=0.9",
     "Accept": "application/json, text/plain, */*",
 }
 TAM_PAGINA_FIXO = 100
+CONSULTA_TAM_PAGINA = 100
+CONSULTA_MAX_PAGINAS_MODALIDADE = 3
+CONSULTA_DIAS_PUBLICACAO = 45
+ANOS_LOOKBACK = 1
+MAX_SEQ_SCAN = 180
+MISS_STREAK_STOP = 40
+MAX_ORGAOS_POR_MUNICIPIO = 8
+MODALIDADES_PADRAO = list(range(1, 14))
 
 STATUS_LABELS = [
     "A Receber/Recebendo Proposta",
@@ -69,6 +83,23 @@ UF_PLACEHOLDER = "— Selecione a UF —"
 # ==========================
 # Utilitários
 # ==========================
+def _secret_int(name: str, default: int) -> int:
+    try:
+        v = int(st.secrets.get(name, default))
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+CFG_ANOS_LOOKBACK = _secret_int("PNCP_ANOS_LOOKBACK", ANOS_LOOKBACK)
+CFG_MAX_SEQ_SCAN = _secret_int("PNCP_MAX_SEQ_SCAN", MAX_SEQ_SCAN)
+CFG_MISS_STREAK_STOP = _secret_int("PNCP_MISS_STREAK_STOP", MISS_STREAK_STOP)
+CFG_MAX_ORGAOS_POR_MUNICIPIO = _secret_int("PNCP_MAX_ORGAOS_POR_MUNICIPIO", MAX_ORGAOS_POR_MUNICIPIO)
+CFG_CONSULTA_TAM_PAGINA = min(500, _secret_int("PNCP_CONSULTA_TAM_PAGINA", CONSULTA_TAM_PAGINA))
+CFG_CONSULTA_MAX_PAGINAS_MODALIDADE = _secret_int("PNCP_CONSULTA_MAX_PAGINAS_MODALIDADE", CONSULTA_MAX_PAGINAS_MODALIDADE)
+CFG_CONSULTA_DIAS_PUBLICACAO = _secret_int("PNCP_CONSULTA_DIAS_PUBLICACAO", CONSULTA_DIAS_PUBLICACAO)
+
+
 def _norm(s: str) -> str:
     s = str(s or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
@@ -138,18 +169,19 @@ def _uid_from_row(row: Dict) -> str:
 # Persistência via GitHub Contents API
 # ==========================
 def _gh_headers() -> Dict[str, str]:
-    tok = st.secrets.get("GITHUB_TOKEN")
-    return {
-        "Authorization": f"token {tok}",
+    h = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "AcerteLicitacoes/PNCP",
     }
+    tok = st.secrets.get("GITHUB_TOKEN")
+    if tok:
+        h["Authorization"] = f"token {tok}"
+    return h
 
 def _gh_cfg_ok() -> bool:
-    has_token = bool(st.secrets.get("GITHUB_TOKEN"))
     has_repo = bool(st.secrets.get("GITHUB_REPO_TEST") or st.secrets.get("GITHUB_REPO"))
-    return has_token and has_repo
+    return has_repo
 
 def _gh_paths(filename: str) -> Tuple[str, str, str]:
     repo = st.secrets.get("GITHUB_REPO_TEST") or st.secrets.get("GITHUB_REPO")
@@ -192,6 +224,8 @@ def _gh_get_json(filename: str) -> Tuple[Optional[dict], Optional[str]]:
 def _gh_put_json(filename: str, payload: dict, sha: Optional[str]) -> None:
     if not _gh_cfg_ok():
         raise RuntimeError("GitHub não configurado")
+    if not st.secrets.get("GITHUB_TOKEN"):
+        raise RuntimeError("GITHUB_TOKEN ausente para escrita no GitHub")
 
     repo, branch, path = _gh_paths(filename)
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
@@ -229,7 +263,14 @@ def load_municipios_pncp() -> pd.DataFrame:
         col_nome = cols_norm.get("municipio") or cols_norm.get("nome") or ("Municipio" if "Municipio" in df.columns else None)
         col_codigo = cols_norm.get("id") or cols_norm.get("codigo") or ("id" if "id" in df.columns else None)
         col_uf = cols_norm.get("uf") or cols_norm.get("estado") or None
-        return col_nome, col_codigo, col_uf
+        col_ibge = (
+            cols_norm.get("codigo_ibge")
+            or cols_norm.get("cod_ibge")
+            or cols_norm.get("ibge")
+            or cols_norm.get("municipio_ibge")
+            or cols_norm.get("codigo_municipio_ibge")
+        )
+        return col_nome, col_codigo, col_uf, col_ibge
 
     for path in CSV_PNCP_PATHS:
         if os.path.exists(path):
@@ -239,7 +280,7 @@ def load_municipios_pncp() -> pd.DataFrame:
                         df = pd.read_csv(path, dtype=str, sep=sep, encoding=enc, engine="python", on_bad_lines="skip")
                         if df is None or df.shape[0] == 0 or df.shape[1] == 0:
                             continue
-                        col_nome, col_codigo, col_uf = _guess_columns(df)
+                        col_nome, col_codigo, col_uf, col_ibge = _guess_columns(df)
                         if not col_nome or not col_codigo:
                             raise ValueError("Não foi possível detectar colunas de 'Municipio' e 'id'.")
                         out = pd.DataFrame({
@@ -247,6 +288,7 @@ def load_municipios_pncp() -> pd.DataFrame:
                             "codigo_pncp": df[col_codigo].astype(str).str.strip(),
                         })
                         out["uf"] = df[col_uf].astype(str).str.strip() if col_uf else ""
+                        out["codigo_ibge"] = df[col_ibge].astype(str).str.strip() if col_ibge else ""
                         out["nome_norm"] = out["nome"].map(_norm)
                         out = out[out["codigo_pncp"] != ""].drop_duplicates(subset=["codigo_pncp"]).reset_index(drop=True)
                         return out
@@ -272,12 +314,21 @@ def load_ibge_catalog() -> Optional[pd.DataFrame]:
                         cols = {c.lower().strip(): c for c in df.columns}
                         col_uf = next((cols[k] for k in cols if k in ["uf", "sigla_uf", "estado"]), None)
                         col_mun = next((cols[k] for k in cols if k in ["municipio", "município", "nome"]), None)
+                        col_ibge = next(
+                            (
+                                cols[k]
+                                for k in cols
+                                if k in ["codigo_ibge", "cod_ibge", "ibge", "codigo", "id_municipio", "municipio_id"]
+                            ),
+                            None,
+                        )
                         if not col_uf or not col_mun:
                             continue
                         out = pd.DataFrame({
                             "uf": df[col_uf].astype(str).str.strip().str.upper(),
                             "municipio": df[col_mun].astype(str).str.strip(),
                         })
+                        out["codigo_ibge"] = df[col_ibge].astype(str).str.strip() if col_ibge else ""
                         out["municipio_norm"] = out["municipio"].map(_norm)
                         out = out.drop_duplicates(subset=["uf", "municipio_norm"]).reset_index(drop=True)
                         return out
@@ -333,74 +384,455 @@ def _persist_marks(path: str, remote_name: str, d: Dict[str, bool]):
         st.error(f"Falha ao salvar marcações localmente: {e}")
 
 # ==========================
-# Coleta PNCP (somente código PNCP em `municipios`)
+# Coleta PNCP (migrada para endpoints oficiais do manual)
 # ==========================
-def consultar_pncp_por_municipio(
+@st.cache_data(ttl=21600, show_spinner=False)
+def _listar_modalidades_ids() -> List[int]:
+    ids: List[int] = []
+    for params in ({}, {"statusAtivo": "true"}):
+        try:
+            r = requests.get(BASE_API_MODALIDADES, params=params, headers=HEADERS, timeout=30)
+            if r.status_code >= 400:
+                continue
+            js = r.json()
+        except Exception:
+            continue
+        itens = js if isinstance(js, list) else _items_from_json(js)
+        for it in itens:
+            try:
+                v = int(it.get("id") or it.get("codigo") or it.get("modalidadeId"))
+                if v > 0:
+                    ids.append(v)
+            except Exception:
+                continue
+    ids = sorted(set(ids))
+    return ids if ids else MODALIDADES_PADRAO
+
+
+def _parse_numero_controle_pncp(numero_controle: str) -> Tuple[str, str, str]:
+    n = str(numero_controle or "").strip()
+    m = re.search(r"^(\d{14})-1-(\d+)/(\d{4})$", n)
+    if not m:
+        return "", "", ""
+    return m.group(1), m.group(3), m.group(2)
+
+
+def _status_compativel_consulta(status_value: str, situacao_id: Optional[int], data_encerramento: str) -> bool:
+    if not status_value:
+        return True
+
+    agora = pd.Timestamp.now(tz=None)
+    fim = pd.to_datetime(data_encerramento, errors="coerce", utc=False)
+    is_fechada_data = bool(pd.notna(fim) and fim < agora)
+
+    if status_value == "recebendo_proposta":
+        return bool(pd.notna(fim) and fim >= agora)
+
+    if status_value == "em_julgamento":
+        return situacao_id == 1 and is_fechada_data
+
+    if status_value == "encerrado":
+        if situacao_id in {2, 3, 4}:
+            return True
+        return is_fechada_data and situacao_id not in {1}
+
+    return True
+
+
+def _consulta_get_items(url: str, params: Dict) -> Tuple[List[Dict], Optional[str]]:
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=35)
+    except Exception as e:
+        return [], f"request_error:{e}"
+
+    if r.status_code in (204, 404):
+        return [], None
+    if r.status_code >= 400:
+        return [], f"http_{r.status_code}"
+
+    body = (r.text or "").strip()
+    ctype = (r.headers.get("content-type") or "").lower()
+    if "json" not in ctype and not body.startswith("{") and not body.startswith("["):
+        return [], "non_json"
+
+    try:
+        js = r.json()
+    except Exception as e:
+        return [], f"json_error:{e}"
+
+    itens = js if isinstance(js, list) else _items_from_json(js)
+    return (itens if isinstance(itens, list) else []), None
+
+
+def _consultar_pncp_api_consulta(
     municipio_id: str,
+    municipio_nome: str,
+    municipio_uf: str,
+    municipio_ibge: str,
+    status_value: str,
+) -> List[Dict]:
+    modalidades = _listar_modalidades_ids()
+    data_final = datetime.now().strftime("%Y%m%d")
+    data_inicial = (datetime.now() - timedelta(days=CFG_CONSULTA_DIAS_PUBLICACAO)).strftime("%Y%m%d")
+
+    endpoint = BASE_API_CONSULTA_PUBLICACAO
+    endpoint_is_proposta = False
+    if status_value == "recebendo_proposta":
+        endpoint = BASE_API_CONSULTA_PROPOSTA
+        endpoint_is_proposta = True
+
+    mun_norm = _norm(municipio_nome)
+    resultados: List[Dict] = []
+    vistos = set()
+    teve_resposta_consulta = False
+
+    for modalidade_id in modalidades:
+        for pagina in range(1, CFG_CONSULTA_MAX_PAGINAS_MODALIDADE + 1):
+            params: Dict[str, str | int] = {
+                "codigoModalidadeContratacao": modalidade_id,
+                "pagina": pagina,
+                "tamanhoPagina": CFG_CONSULTA_TAM_PAGINA,
+            }
+            if endpoint_is_proposta:
+                params["dataFinal"] = data_final
+            else:
+                params["dataInicial"] = data_inicial
+                params["dataFinal"] = data_final
+            if municipio_uf:
+                params["uf"] = str(municipio_uf).upper()
+            if municipio_ibge:
+                params["codigoMunicipioIbge"] = str(municipio_ibge)
+
+            itens, err = _consulta_get_items(endpoint, params)
+            if err:
+                break
+            teve_resposta_consulta = True
+            if not itens:
+                break
+
+            for item in itens:
+                unidade = item.get("unidadeOrgao") or {}
+                orgao = item.get("orgaoEntidade") or {}
+                cidade_api = str(unidade.get("municipioNome") or municipio_nome or "").strip()
+                uf_api = str(unidade.get("ufSigla") or municipio_uf or "").strip().upper()
+                ibge_api = str(unidade.get("codigoIbge") or "")
+
+                # Quando não houver código IBGE no catálogo local, filtra por nome/UF.
+                if not municipio_ibge:
+                    if mun_norm and _norm(cidade_api) != mun_norm:
+                        continue
+                    if municipio_uf and uf_api and uf_api != str(municipio_uf).upper():
+                        continue
+                else:
+                    if ibge_api and str(ibge_api) != str(municipio_ibge):
+                        continue
+
+                sit_id_raw = item.get("situacaoCompraId")
+                try:
+                    sit_id = int(sit_id_raw) if sit_id_raw is not None else None
+                except Exception:
+                    sit_id = None
+                data_enc = str(item.get("dataEncerramentoProposta") or "")
+
+                # Para "recebendo proposta", o endpoint /proposta já filtra.
+                if not endpoint_is_proposta and not _status_compativel_consulta(status_value, sit_id, data_enc):
+                    continue
+
+                numero_controle = str(item.get("numeroControlePNCP") or "")
+                cnpj, ano_ctrl, seq_ctrl = _parse_numero_controle_pncp(numero_controle)
+                if not cnpj:
+                    cnpj = str(orgao.get("cnpj") or "").strip()
+                ano = str(item.get("anoCompra") or ano_ctrl or "").strip()
+                seq = str(item.get("sequencialCompra") or seq_ctrl or "").strip()
+
+                uid = f"{cnpj}-{ano}-{seq}" if cnpj and ano and seq else numero_controle
+                if uid and uid in vistos:
+                    continue
+                if uid:
+                    vistos.add(uid)
+
+                tipo_inst = str(item.get("tipoInstrumentoConvocatorioNome") or "").strip()
+                numero_compra = str(item.get("numeroCompra") or "").strip()
+                titulo = _primeiro_valor(
+                    item.get("titulo"),
+                    item.get("title"),
+                    f"{tipo_inst} nº {numero_compra}".strip(),
+                    numero_controle,
+                    "Edital",
+                )
+
+                resultados.append(
+                    {
+                        "municipio_codigo": municipio_id,
+                        "municipio_nome": cidade_api or municipio_nome,
+                        "uf": uf_api or municipio_uf,
+                        "orgao_cnpj": cnpj,
+                        "orgao_nome": str(orgao.get("razaosocial") or orgao.get("razaoSocial") or ""),
+                        "ano": ano,
+                        "numero_sequencial": seq,
+                        "title": titulo,
+                        "description": _primeiro_valor(item.get("objetoCompra"), item.get("informacaoComplementar"), ""),
+                        "document_type": tipo_inst,
+                        "modalidade_licitacao_nome": str(item.get("modalidadeNome") or ""),
+                        "data_publicacao_pncp": _primeiro_valor(
+                            item.get("dataPublicacaoPncp"),
+                            item.get("dataAtualizacao"),
+                            item.get("dataInclusao"),
+                        ),
+                        "data_fim_vigencia": data_enc,
+                        "numeroProcesso": str(item.get("processo") or ""),
+                        "item_url": f"/app/editais/{cnpj}/{ano}/{seq}" if cnpj and ano and seq else "",
+                        "id": uid or numero_controle,
+                    }
+                )
+
+            if len(itens) < CFG_CONSULTA_TAM_PAGINA:
+                break
+
+    if not teve_resposta_consulta and not resultados:
+        raise RuntimeError("API de Consultas indisponível ou não-JSON")
+
+    return resultados
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _buscar_orgaos_por_municipio_nome(municipio_nome: str) -> List[Dict]:
+    nome = str(municipio_nome or "").strip()
+    if not nome or len(nome) < 3:
+        return []
+
+    coletados: List[Dict] = []
+    for pagina in range(1, 6):
+        try:
+            r = requests.get(
+                BASE_API_ORGAOS,
+                params={"razaoSocial": nome, "pagina": pagina},
+                headers=HEADERS,
+                timeout=30,
+            )
+            r.raise_for_status()
+            js = r.json()
+        except Exception:
+            break
+
+        itens = js if isinstance(js, list) else _items_from_json(js)
+        if not isinstance(itens, list) or not itens:
+            break
+
+        coletados.extend(itens)
+        if len(itens) < 20:
+            break
+
+    mun_norm = _norm(nome)
+    ranked: List[Tuple[int, Dict]] = []
+    seen = set()
+    for o in coletados:
+        cnpj = str(o.get("cnpj") or "").strip()
+        razao = str(o.get("razaoSocial") or "").strip()
+        if len(cnpj) != 14 or cnpj in seen:
+            continue
+        seen.add(cnpj)
+
+        # reduz ruído de entidades não municipais
+        esfera = str(o.get("esferaId") or "").upper()
+        if esfera and esfera != "M":
+            continue
+
+        rz = _norm(razao)
+        if mun_norm and mun_norm not in rz:
+            continue
+
+        score = 0
+        if f"municipio_de_{mun_norm}" in rz:
+            score += 100
+        if f"prefeitura_municipal_de_{mun_norm}" in rz:
+            score += 90
+        if f"camara_municipal_de_{mun_norm}" in rz:
+            score += 80
+        if "fundo_municipal" in rz:
+            score += 30
+        if "consorcio_intermunicipal" in rz:
+            score += 20
+        if "condominio" in rz:
+            score -= 50
+
+        ranked.append((score, {"cnpj": cnpj, "razao": razao}))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [r[1] for r in ranked[:CFG_MAX_ORGAOS_POR_MUNICIPIO]]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _listar_arquivos_compra(cnpj: str, ano: int, seq: int) -> List[Dict]:
+    url = BASE_API_ARQUIVOS.format(cnpj=cnpj, ano=ano, seq=seq)
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    js = r.json()
+    return js if isinstance(js, list) else _items_from_json(js)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _primeiro_item_compra(cnpj: str, ano: int, seq: int) -> Dict:
+    url = BASE_API_ITENS.format(cnpj=cnpj, ano=ano, seq=seq)
+    r = requests.get(url, params={"pagina": 1, "tamanhoPagina": 1}, headers=HEADERS, timeout=30)
+    if r.status_code == 404:
+        return {}
+    r.raise_for_status()
+    js = r.json()
+    if isinstance(js, list) and js:
+        return js[0]
+    itens = _items_from_json(js)
+    return itens[0] if itens else {}
+
+
+def _status_compativel_aprox(status_value: str, situacao_item_nome: str) -> bool:
+    if not status_value:
+        return True
+
+    s = _norm(situacao_item_nome)
+    encerrados = {"homologado", "anulado_revogado_cancelado", "deserto", "fracassado"}
+    andamento = {"em_andamento", "pendente", ""}
+
+    if status_value == "encerrado":
+        return s in encerrados
+    if status_value in {"recebendo_proposta", "em_julgamento"}:
+        return s in andamento
+    return True
+
+
+def _consultar_pncp_por_municipio_scan(
+    municipio_id: str,
+    municipio_nome: str,
+    municipio_uf: str = "",
+    municipio_ibge: str = "",
     status_value: str = "recebendo_proposta",
     tam_pagina: int = TAM_PAGINA_FIXO,
-    delay_s: float = 0.05,
+    delay_s: float = 0.02,
 ) -> List[Dict]:
-    out: List[Dict] = []
-    pagina = 1
-    while True:
-        params = {
-            "tipos_documento": "edital",
-            "ordenacao": "-data",
-            "pagina": pagina,
-            "tam_pagina": tam_pagina,
-            "municipios": municipio_id,
-        }
-        if status_value:
-            params["status"] = status_value
+    del municipio_uf, municipio_ibge
+    del tam_pagina  # paginação de busca não existe nesses endpoints; mantido por compatibilidade
 
-        r = requests.get(BASE_API, params=params, headers=HEADERS, timeout=30)
+    resultados: List[Dict] = []
+    vistos = set()
+    orgaos = _buscar_orgaos_por_municipio_nome(municipio_nome)
+    anos = [datetime.now().year - i for i in range(CFG_ANOS_LOOKBACK + 1)]
 
-        # erro HTTP real
-        r.raise_for_status()
+    for org in orgaos:
+        cnpj = str(org.get("cnpj") or "").strip()
+        orgao_nome = str(org.get("razao") or "").strip()
+        if len(cnpj) != 14:
+            continue
 
-        # proteção para resposta vazia / HTML / anti-bot
-        body = (r.text or "").strip()
-        if not body:
-            break
+        for ano in anos:
+            misses = 0
+            for seq in range(1, CFG_MAX_SEQ_SCAN + 1):
+                try:
+                    arqs = _listar_arquivos_compra(cnpj, ano, seq)
+                except Exception:
+                    misses += 1
+                    if misses >= CFG_MISS_STREAK_STOP and seq > 30:
+                        break
+                    continue
 
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        if "json" not in ctype and not (body.startswith("{") or body.startswith("[")):
-            break
+                if not arqs:
+                    misses += 1
+                    if misses >= CFG_MISS_STREAK_STOP and seq > 30:
+                        break
+                    continue
 
-        try:
-            js = r.json()
-        except ValueError:
-            break
+                misses = 0
+                doc = next(
+                    (
+                        a
+                        for a in arqs
+                        if "edital" in _norm(a.get("tipoDocumentoNome", ""))
+                        or "aviso" in _norm(a.get("tipoDocumentoNome", ""))
+                    ),
+                    None,
+                )
+                if not doc:
+                    continue
 
-        itens = _items_from_json(js)
-        if not itens:
-            break
+                item0 = {}
+                try:
+                    item0 = _primeiro_item_compra(cnpj, ano, seq)
+                except Exception:
+                    item0 = {}
 
-        out.extend(itens)
-        if len(itens) < tam_pagina:
-            break
+                sit_nome = str(item0.get("situacaoCompraItemNome") or "")
+                if not _status_compativel_aprox(status_value, sit_nome):
+                    continue
 
-        pagina += 1
-        time.sleep(delay_s)
+                uid = f"{cnpj}-{ano}-{seq}"
+                if uid in vistos:
+                    continue
+                vistos.add(uid)
 
-    return out
+                resultados.append(
+                    {
+                        "municipio_codigo": municipio_id,
+                        "municipio_nome": municipio_nome,
+                        "orgao_cnpj": cnpj,
+                        "orgao_nome": orgao_nome,
+                        "ano": str(ano),
+                        "numero_sequencial": str(seq),
+                        "title": doc.get("titulo") or f"Edital {ano}/{seq}",
+                        "description": item0.get("descricao") or "",
+                        "document_type": doc.get("tipoDocumentoNome") or "",
+                        "data_publicacao_pncp": doc.get("dataPublicacaoPncp") or item0.get("dataInclusao") or "",
+                        "situacao_compra_item_nome": sit_nome,
+                        "item_url": f"/app/editais/{cnpj}/{ano}/{seq}",
+                        "id": uid,
+                    }
+                )
+                time.sleep(delay_s)
 
-def montar_registro(item: Dict, municipio_codigo: str) -> Dict:
+    return resultados
+
+
+def consultar_pncp_por_municipio(
+    municipio_id: str,
+    municipio_nome: str,
+    municipio_uf: str = "",
+    municipio_ibge: str = "",
+    status_value: str = "recebendo_proposta",
+    tam_pagina: int = TAM_PAGINA_FIXO,
+    delay_s: float = 0.02,
+) -> List[Dict]:
+    # 1) Fluxo principal: API de Consultas oficial (/api/consulta/v1)
+    try:
+        return _consultar_pncp_api_consulta(
+            municipio_id=municipio_id,
+            municipio_nome=municipio_nome,
+            municipio_uf=municipio_uf,
+            municipio_ibge=municipio_ibge,
+            status_value=status_value,
+        )
+    except Exception:
+        # 2) Fallback: endpoints do manual de integração (/pncp-api/v1/orgaos/...)
+        return _consultar_pncp_por_municipio_scan(
+            municipio_id=municipio_id,
+            municipio_nome=municipio_nome,
+            municipio_uf=municipio_uf,
+            municipio_ibge=municipio_ibge,
+            status_value=status_value,
+            tam_pagina=tam_pagina,
+            delay_s=delay_s,
+        )
+
+    return []
+
+
+def montar_registro(item: Dict, municipio_codigo: str, municipio_nome: str, municipio_uf: str = "") -> Dict:
     pub_raw = item.get("data_publicacao_pncp") or item.get("data") or item.get("dataPublicacao") or ""
-    fim_raw = item.get("data_fim_vigencia") or item.get("fimEnvioProposta") or ""
+    fim_raw = item.get("data_fim_vigencia") or item.get("dataEncerramentoProposta") or item.get("fimEnvioProposta") or ""
 
     processo = _primeiro_valor(
         item.get("numeroProcesso"),
         item.get("processo"),
         item.get("numero_processo"),
-        item.get("numeroProcessoLicitatorio"),
-        item.get("numero_processo_licitatorio"),
-        item.get("processoLicitatorio"),
-        item.get("numProcesso"),
-        item.get("processNumber"),
-        item.get("numero_processo_adm"),
-        item.get("numeroProcessoAdministrativo"),
     )
 
     orgao_cnpj = str(item.get("orgao_cnpj") or "").strip()
@@ -410,11 +842,13 @@ def montar_registro(item: Dict, municipio_codigo: str) -> Dict:
 
     return {
         "municipio_codigo": municipio_codigo,
-        "Cidade": item.get("municipio_nome", ""),
-        "UF": item.get("uf", ""),
+        "Cidade": item.get("municipio_nome", "") or municipio_nome,
+        "UF": item.get("uf", "") or municipio_uf,
         "Título": item.get("title", "") or item.get("titulo", ""),
         "Objeto": item.get("description", "") or item.get("objeto", ""),
-        "Link para o edital": _build_pncp_link(item),
+        "Link para o edital": _build_pncp_link(
+            {"orgao_cnpj": orgao_cnpj, "ano": ano, "numero_sequencial": seq, "item_url": item.get("item_url", "")}
+        ),
         "Modalidade": item.get("modalidade_licitacao_nome", ""),
         "Tipo": item.get("tipo_nome", ""),
         "Tipo (documento)": item.get("document_type", ""),
@@ -470,17 +904,28 @@ def _ensure_session_state():
 @st.cache_data(ttl=900, show_spinner=False)
 def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
     registros: List[Dict] = []
-    codigos = signature.get("municipios", [])
+    municipios_meta = signature.get("municipios_meta", [])
     status_value = signature.get("status", "")
-    for codigo in codigos:
+    for m in municipios_meta:
+        codigo = str(m.get("codigo_pncp") or "").strip()
+        nome = str(m.get("nome") or "").strip()
+        uf = str(m.get("uf") or "").strip()
+        codigo_ibge = str(m.get("codigo_ibge") or "").strip()
+        if not codigo or not nome:
+            continue
         try:
             itens = consultar_pncp_por_municipio(
-                codigo, status_value=status_value, tam_pagina=TAM_PAGINA_FIXO
+                municipio_id=codigo,
+                municipio_nome=nome,
+                municipio_uf=uf,
+                municipio_ibge=codigo_ibge,
+                status_value=status_value,
+                tam_pagina=TAM_PAGINA_FIXO,
             )
         except Exception:
             itens = []
         for it in itens:
-            registros.append(montar_registro(it, codigo))
+            registros.append(montar_registro(it, codigo, nome, uf))
 
     df = pd.DataFrame(registros)
 
@@ -684,9 +1129,10 @@ def _add_municipio_by_name(nome_municipio: str, uf: Optional[str], pncp_df: pd.D
     codigo = row["codigo_pncp"]
     nome = row["nome"]
     uf_val = row.get("uf", uf or "")
+    codigo_ibge = str(row.get("codigo_ibge", "") or "").strip()
     if codigo in [m["codigo_pncp"] for m in sel]:
         return
-    sel.append({"codigo_pncp": codigo, "nome": nome, "uf": uf_val})
+    sel.append({"codigo_pncp": codigo, "nome": nome, "uf": uf_val, "codigo_ibge": codigo_ibge})
 
 def _cb_prev(total_pages: int):
     st.session_state.card_page = max(1, int(st.session_state.get("card_page", 1)) - 1)
@@ -780,10 +1226,36 @@ def main():
 
     disparar_busca = _sidebar(pncp_df, ibge_df)
 
+    # Enriquecimento retrocompatível para pesquisas salvas antigas (sem codigo_ibge)
+    if st.session_state.selected_municipios:
+        mapa_ibge = {}
+        if "codigo_pncp" in pncp_df.columns and "codigo_ibge" in pncp_df.columns:
+            try:
+                mapa_ibge = (
+                    pncp_df[["codigo_pncp", "codigo_ibge"]]
+                    .drop_duplicates(subset=["codigo_pncp"])
+                    .set_index("codigo_pncp")["codigo_ibge"]
+                    .to_dict()
+                )
+            except Exception:
+                mapa_ibge = {}
+        for m in st.session_state.selected_municipios:
+            if not str(m.get("codigo_ibge") or "").strip():
+                m["codigo_ibge"] = str(mapa_ibge.get(str(m.get("codigo_pncp") or "").strip(), "") or "").strip()
+
     status_value = STATUS_MAP.get(st.session_state.sidebar_inputs["status_label"], "")
     palavra_chave = (st.session_state.sidebar_inputs["palavra_chave"] or "").strip()
     signature = {
         "municipios": [m["codigo_pncp"] for m in st.session_state.selected_municipios],
+        "municipios_meta": [
+            {
+                "codigo_pncp": str(m.get("codigo_pncp") or "").strip(),
+                "nome": str(m.get("nome") or "").strip(),
+                "uf": str(m.get("uf") or "").strip(),
+                "codigo_ibge": str(m.get("codigo_ibge") or "").strip(),
+            }
+            for m in st.session_state.selected_municipios
+        ],
         "status": status_value,
         "q": palavra_chave.lower(),
     }
@@ -938,3 +1410,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

@@ -361,21 +361,21 @@ def consultar_pncp_por_municipio(
 
         params_variacoes = [
             {
-                "tipos_documento": "edital",
-                "ordenacao": "-data",
-                "pagina": pagina,
-                "tam_pagina": tam_pagina,
-                "municipios": municipio_id,
-                "status": status_value,
-            },
-            {
-                "tiposDocumento": "edital",
-                "ordenacao": "-data",
-                "pagina": pagina,
-                "tamanhoPagina": tam_pagina,
-                "municipios": municipio_id,
-                "status": status_value,
-            },
+    "tiposDocumento": "edital",
+    "ordenacao": "-dataPublicacaoPncp",
+    "pagina": pagina,
+    "tamanhoPagina": tam_pagina,
+    "municipios": municipio_id,
+    "status": status_value,
+},
+           {
+    "tiposDocumento": "edital",
+    "ordenacao": "-dataPublicacaoPncp",
+    "pagina": pagina,
+    "tamanhoPagina": tam_pagina,
+    "municipios": municipio_id,
+    "status": status_value,
+},
             {
                 "tiposDocumento": "edital",
                 "ordenacao": "-dataPublicacaoPncp",

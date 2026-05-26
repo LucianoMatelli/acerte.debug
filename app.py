@@ -43,10 +43,7 @@ SAVED_TR_PATH = os.path.join(BASE_DIR, "tr_marks.json")
 SAVED_NA_PATH = os.path.join(BASE_DIR, "na_marks.json")
 
 ORIGIN = "https://pncp.gov.br"
-BASE_APIS = [
-    ORIGIN + "/api/search",
-    ORIGIN + "/api/search/",  # fallback
-]
+BASE_API = ORIGIN + "/api/search"
 HEADERS = {
     "User-Agent": "AcerteLicitacoes/1.1 (+streamlit)",
     "Referer": "https://pncp.gov.br/app/editais",
@@ -61,16 +58,10 @@ STATUS_LABELS = [
     "Todos",
 ]
 STATUS_MAP = {
-    "A Receber/Recebendo Proposta": "recebendo_propostas",
-    "Em Julgamento/Propostas Encerradas": "propostas_encerradas",
-    "Encerradas": "encerradas",
+    "A Receber/Recebendo Proposta": "recebendo_proposta",
+    "Em Julgamento/Propostas Encerradas": "em_julgamento",
+    "Encerradas": "encerrado",
     "Todos": "",
-}
-STATUS_ALIASES = {
-    "recebendo_propostas": ["recebendo_propostas", "recebendo_proposta"],
-    "propostas_encerradas": ["propostas_encerradas", "em_julgamento"],
-    "encerradas": ["encerradas", "encerrado"],
-    "": [""],
 }
 UF_PLACEHOLDER = "— Selecione a UF —"
 
@@ -86,10 +77,7 @@ def _norm(s: str) -> str:
 
 def _items_from_json(js) -> List[Dict]:
     if isinstance(js, dict):
-        for k in [
-            "items", "results", "conteudo", "licitacoes", "data",
-            "documents", "documentos", "content", "resultados"
-        ]:
+        for k in ["items", "results", "conteudo", "licitacoes", "data", "documents", "documentos", "content", "resultados"]:
             v = js.get(k)
             if isinstance(v, list):
                 return v
@@ -165,10 +153,10 @@ def _gh_cfg_ok() -> bool:
     return bool(st.secrets.get("GITHUB_TOKEN") and st.secrets.get("GITHUB_REPO"))
 
 def _gh_paths(filename: str) -> Tuple[str, str, str]:
-    repo = st.secrets["GITHUB_REPO"]
+    repo   = st.secrets["GITHUB_REPO"]
     branch = st.secrets.get("GITHUB_BRANCH", "main")
-    based = st.secrets.get("GITHUB_BASEDIR", "data")
-    path = f"{based.rstrip('/')}/{filename}"
+    based  = st.secrets.get("GITHUB_BASEDIR", "data")
+    path   = f"{based.rstrip('/')}/{filename}"
     return repo, branch, path
 
 def _gh_get_json(filename: str) -> Tuple[Optional[dict], Optional[str]]:
@@ -331,60 +319,60 @@ def _persist_marks(path: str, remote_name: str, d: Dict[str, bool]):
         st.error(f"Falha ao salvar marcações localmente: {e}")
 
 # ==========================
-# Coleta PNCP (corrigida)
+# Coleta PNCP (corrigida sem alterar fluxo do app)
 # ==========================
 def consultar_pncp_por_municipio(
     municipio_id: str,
-    status_value: str = "recebendo_propostas",
+    status_value: str = "recebendo_proposta",
     tam_pagina: int = TAM_PAGINA_FIXO,
     delay_s: float = 0.05,
 ) -> List[Dict]:
     out: List[Dict] = []
     pagina = 1
-    status_candidates = STATUS_ALIASES.get(status_value, [status_value])
-
     while True:
-        itens_pagina: List[Dict] = []
-        last_err = None
+        params = {
+            "tipos_documento": "edital",
+            "ordenacao": "-data",
+            "pagina": pagina,
+            "tam_pagina": tam_pagina,
+            "municipios": municipio_id,
+        }
+        if status_value:
+            params["status"] = status_value
 
-        for api_url in BASE_APIS:
-            for st_candidate in status_candidates:
-                params = {
-                    "tipos_documento": "edital",
-                    "ordenacao": "-data",
-                    "pagina": pagina,
-                    "tam_pagina": tam_pagina,
-                    "municipios": municipio_id,
-                }
-                if st_candidate:
-                    params["status"] = st_candidate
+        r = requests.get(BASE_API, params=params, headers=HEADERS, timeout=30)
 
-                try:
-                    r = requests.get(api_url, params=params, headers=HEADERS, timeout=30)
-                    r.raise_for_status()
-                    js = r.json()
-                    itens_pagina = _items_from_json(js)
-                    if itens_pagina:
-                        break
-                except Exception as e:
-                    last_err = e
-                    continue
-            if itens_pagina:
-                break
+        # mantém raise para HTTP error, mas evita quebra de JSON decode em respostas não JSON
+        r.raise_for_status()
 
-        if not itens_pagina:
-            if last_err and pagina == 1:
-                raise RuntimeError(f"Falha ao consultar PNCP (município {municipio_id}): {last_err}")
+        body = (r.text or "").strip()
+        if not body:
+            break  # resposta vazia => sem itens
+
+        content_type = (r.headers.get("Content-Type") or "").lower()
+        looks_like_json = body.startswith("{") or body.startswith("[")
+
+        if "json" not in content_type and not looks_like_json:
+            # endpoint respondeu HTML/texto; tratamos como sem dados para não derrubar a busca
             break
 
-        out.extend(itens_pagina)
+        try:
+            js = r.json()
+        except ValueError:
+            # JSON inválido; evita crash "Expecting value..."
+            break
 
-        if len(itens_pagina) < tam_pagina:
+        itens = _items_from_json(js)
+
+        if not itens:
+            break
+
+        out.extend(itens)
+        if len(itens) < tam_pagina:
             break
 
         pagina += 1
         time.sleep(delay_s)
-
     return out
 
 def montar_registro(item: Dict, municipio_codigo: str) -> Dict:
@@ -437,13 +425,13 @@ def montar_registro(item: Dict, municipio_codigo: str) -> Dict:
 # ==========================
 def _ensure_session_state():
     if "selected_municipios" not in st.session_state:
-        st.session_state.selected_municipios = []
+        st.session_state.selected_municipios = []  # list[{codigo_pncp,nome,uf}]
     if "saved_searches" not in st.session_state:
         st.session_state.saved_searches = _load_saved_searches()
     if "sidebar_inputs" not in st.session_state:
         st.session_state.sidebar_inputs = {
             "palavra_chave": "",
-            "status_label": STATUS_LABELS[0],
+            "status_label": STATUS_LABELS[0],  # default
             "uf": UF_PLACEHOLDER,
             "save_name": "",
             "selected_saved": None,
@@ -457,7 +445,7 @@ def _ensure_session_state():
     if "page_size_cards" not in st.session_state:
         st.session_state.page_size_cards = 10
     if "results_df" not in st.session_state:
-        st.session_state.results_df = None
+        st.session_state.results_df = None  # list[dict]
     if "results_signature" not in st.session_state:
         st.session_state.results_signature = None
     if "tr_marks" not in st.session_state:
@@ -470,18 +458,23 @@ def _ensure_session_state():
 # ==========================
 @st.cache_data(ttl=900, show_spinner=False)
 def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
+    """Coleção consolidada por assinatura de filtros (municípios, status, q)."""
     registros: List[Dict] = []
     codigos = signature.get("municipios", [])
     status_value = signature.get("status", "")
     for codigo in codigos:
-        itens = consultar_pncp_por_municipio(
-            codigo, status_value=status_value, tam_pagina=TAM_PAGINA_FIXO
-        )
+        try:
+            itens = consultar_pncp_por_municipio(
+                codigo, status_value=status_value, tam_pagina=TAM_PAGINA_FIXO
+            )
+        except Exception:
+            itens = []
         for it in itens:
             registros.append(montar_registro(it, codigo))
 
     df = pd.DataFrame(registros)
 
+    # Filtro client-side por palavra-chave (título/objeto)
     q = (signature.get("q") or "").strip()
     if q and not df.empty:
         mask = (
@@ -490,6 +483,7 @@ def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
         )
         df = df[mask].copy()
 
+    # Ordenação por data de publicação (desc)
     try:
         df["_pub_dt"] = pd.to_datetime(df["_pub_raw"], errors="coerce", utc=False)
     except Exception:
@@ -504,6 +498,7 @@ def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
 def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]):
     st.sidebar.header("🔎 Filtros")
 
+    # Palavra-chave e Status (reativos)
     palavra = st.sidebar.text_input(
         "Palavra-chave (aplicada no título/objeto):",
         value=st.session_state.sidebar_inputs["palavra_chave"],
@@ -517,6 +512,7 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]):
         help="Agrupamentos mapeados para valores aceitos pela API do PNCP.",
     )
 
+    # UFs disponíveis
     if ibge_df is not None:
         ufs = sorted(ibge_df["uf"].dropna().unique().tolist())
     else:
@@ -524,6 +520,7 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]):
 
     ufs = [UF_PLACEHOLDER] + ufs
 
+    # Estado (reativo e obrigatório)
     uf = st.sidebar.selectbox(
         "Estado (UF) — Obrigatório:",
         ufs,
@@ -531,10 +528,12 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]):
         key="uf_select",
     )
 
+    # Detecta mudança de UF para forçar reset do select de município
     if uf != st.session_state.uf_prev:
         st.session_state.uf_prev = uf
-        st.session_state.municipio_nonce += 1
+        st.session_state.municipio_nonce += 1  # invalida/selectbox key para reconstruir widget
 
+    # Municípios (reativo; depende da UF)
     st.sidebar.markdown("**Municípios (máx. 25)**")
     if uf == UF_PLACEHOLDER:
         st.sidebar.info("Selecione um Estado (UF) para habilitar a seleção de municípios.")
@@ -572,6 +571,7 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]):
                 nome_sel, uf_sel, _ = sel_row
                 _add_municipio_by_name(nome_sel, uf_sel, pncp_df)
 
+    # Lista dos selecionados (com botão de remover “✕”)
     if st.session_state.selected_municipios:
         st.sidebar.caption("Selecionados:")
         keep_list = []
@@ -581,13 +581,14 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]):
                 st.markdown(f"- **{m['nome']}** / {m.get('uf','')} (`{m['codigo_pncp']}`)")
             with c2:
                 if st.button("✕", key=f"rm_{m['codigo_pncp']}", help=f"Remover {m['nome']}"):
-                    pass
+                    pass  # removido
                 else:
                     keep_list.append(m)
         if len(keep_list) != len(st.session_state.selected_municipios):
             st.session_state.selected_municipios = keep_list
             st.rerun()
 
+    # Salvar / Excluir lado a lado
     st.sidebar.subheader("💾 Pesquisa salva")
     save_name = st.sidebar.text_input(
         "Nome da pesquisa", value=st.session_state.sidebar_inputs["save_name"], key="save_name_input"
@@ -621,6 +622,7 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]):
             _persist_saved_searches(st.session_state.saved_searches)
             st.sidebar.success(f"Pesquisa '{name}' salva.")
 
+    # Lista de pesquisas salvas
     st.sidebar.subheader("📚 Pesquisas salvas")
     saved_names = sorted(list(st.session_state.saved_searches.keys()))
     selected_saved = st.sidebar.selectbox("Carregar pesquisa", ["—"] + saved_names, index=0, key="select_saved")
@@ -639,18 +641,20 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]):
                 )
                 st.session_state.sidebar_inputs["uf"] = payload.get("uf", UF_PLACEHOLDER)
                 st.session_state.uf_prev = st.session_state.sidebar_inputs["uf"]
-                st.session_state.municipio_nonce += 1
+                st.session_state.municipio_nonce += 1  # força reconstrução do seletor de município
                 st.session_state.selected_municipios = payload.get("municipios", [])
                 st.session_state.sidebar_inputs["save_name"] = sel
                 st.sidebar.success(f"Pesquisa '{sel}' carregada.")
                 st.rerun()
 
+    # Atualiza inputs persistidos (sem disparar coleta ainda)
     st.session_state.sidebar_inputs["palavra_chave"] = palavra
     st.session_state.sidebar_inputs["status_label"] = status_label
     st.session_state.sidebar_inputs["uf"] = uf
     st.session_state.sidebar_inputs["save_name"] = save_name
     st.session_state.sidebar_inputs["selected_saved"] = selected_saved
 
+    # Botão principal — ao final e com validação de UF obrigatória
     disparar_busca = st.sidebar.button("🔎 Pesquisar", use_container_width=True, type="primary", key="btn_pesquisar")
     if disparar_busca and uf == UF_PLACEHOLDER:
         st.sidebar.error("Selecione uma UF para habilitar a pesquisa.")
@@ -693,7 +697,7 @@ def _cb_prev(total_pages: int):
     st.session_state.card_page = max(1, int(st.session_state.get("card_page", 1)) - 1)
 
 def _cb_next(total_pages: int):
-    st.session_state.card_page = min(total_pages, int(st.session_state.get("card_page", 1)) + 1)
+    st.session_state.card_page = min(total_pages, int(st.session_state.get("card_page", 1) + 1))
 
 def _cb_page_size_change():
     st.session_state.card_page = 1
@@ -705,6 +709,7 @@ def main():
     st.title("📑 Acerte Licitações — O seu Buscador de Editais")
     st.caption("Selecione os filtros desejados como palavra-chave no título/objeto, selecione o Estado (UF) e até 25 municípios. Os editais serão exibidos abaixo, em ordem de publicação.")
 
+    # ======== CSS Premium ========
     st.markdown('''
         <style>
         section[data-testid="stSidebar"] {
@@ -772,6 +777,7 @@ def main():
 
     _ensure_session_state()
 
+    # Carregar bases
     try:
         pncp_df = load_municipios_pncp()
     except Exception as e:
@@ -779,8 +785,10 @@ def main():
         st.stop()
     ibge_df = load_ibge_catalog()
 
+    # Sidebar reativa
     disparar_busca = _sidebar(pncp_df, ibge_df)
 
+    # Monta assinatura e decide origem dos dados (cache vs memória)
     status_value = STATUS_MAP.get(st.session_state.sidebar_inputs["status_label"], "")
     palavra_chave = (st.session_state.sidebar_inputs["palavra_chave"] or "").strip()
     signature = {
@@ -794,14 +802,10 @@ def main():
             st.warning("Selecione pelo menos um município para pesquisar.")
             st.stop()
         with st.spinner("Coletando dados no PNCP..."):
-            try:
-                df = coletar_por_assinatura(signature)
-            except Exception as e:
-                st.error(f"Erro ao consultar PNCP: {e}")
-                st.stop()
+            df = coletar_por_assinatura(signature)
         st.session_state.results_df = df.to_dict("records")
         st.session_state.results_signature = signature
-        st.session_state.card_page = 1
+        st.session_state.card_page = 1  # reinicia paginação a cada nova coleta
     else:
         if st.session_state.results_df is None:
             st.info("Configure os filtros e clique em **Pesquisar**.")
@@ -811,6 +815,7 @@ def main():
         if st.session_state.results_signature and signature != st.session_state.results_signature:
             st.warning("Filtros alterados após a última coleta. Clique em **Pesquisar** para atualizar os resultados.")
 
+    # ===== Renderização =====
     st.subheader(f"Resultados ({len(df)})")
     if df.empty:
         st.info("Nenhum resultado encontrado com os critérios atuais.")
@@ -850,11 +855,13 @@ def main():
     end = start + page_size_cards
     page_df = df.iloc[start:end].copy()
 
+    # ====== CARDS ======
     for _, row in page_df.iterrows():
         uid = _uid_from_row(row)
         tr_flag = bool(st.session_state.tr_marks.get(uid, False))
         na_flag = bool(st.session_state.na_marks.get(uid, False))
 
+        # checkboxes lado a lado, acima do card (à direita)
         col_spacer, col_cb_tr, col_cb_na = st.columns([6, 1.3, 1.3])
         with col_cb_tr:
             new_tr = st.checkbox("TR Elaborado", value=tr_flag, key=f"tr_{uid}")
@@ -873,21 +880,21 @@ def main():
         if updated:
             st.rerun()
 
-        link = row.get("Link para o edital", "")
-        titulo = row.get("Título") or "(Sem título)"
-        cidade = row.get("Cidade", "")
-        uf = row.get("UF", "")
-        pub = row.get("Publicação", "")
-        fim = row.get("Fim do envio de proposta", "")
-        objeto = row.get("Objeto", "")
-        modalidade = row.get("Modalidade", "")
-        tipo = row.get("Tipo", "")
-        orgao = row.get("Orgão", "")
-        proc = (row.get("numero_processo") or "").strip()
+        link = row.get('Link para o edital','')
+        titulo = row.get('Título') or '(Sem título)'
+        cidade = row.get('Cidade','')
+        uf = row.get('UF','')
+        pub = row.get('Publicação','')
+        fim = row.get('Fim do envio de proposta','')
+        objeto = row.get('Objeto','')
+        modalidade = row.get('Modalidade','')
+        tipo = row.get('Tipo','')
+        orgao = row.get('Orgão','')
+        proc = (row.get('numero_processo') or '').strip()
 
-        tr_badge = '<span class="ac-flag">TR Elaborado</span>' if new_tr else ""
-        na_badge = '<span class="ac-flag-na">Não Atende</span>' if new_na else ""
-        processo_html = f'<div class="ac-muted">Processo: {proc}</div>' if proc else "<div></div>"
+        tr_badge = '<span class="ac-flag">TR Elaborado</span>' if new_tr else ''
+        na_badge = '<span class="ac-flag-na">Não Atende</span>' if new_na else ''
+        processo_html = f'<div class="ac-muted">Processo: {proc}</div>' if proc else '<div></div>'
 
         html = f'''
         <div class="ac-card">
@@ -913,6 +920,7 @@ def main():
         '''
         st.markdown(html, unsafe_allow_html=True)
 
+    # Paginação (rodapé)
     col_a2, col_b2, col_c2 = st.columns([1, 2, 1])
     with col_a2:
         st.button("◀ Anterior", key="prev_bottom", disabled=(st.session_state.get("card_page", 1) <= 1),
@@ -925,6 +933,7 @@ def main():
 
     st.divider()
 
+    # ===== Exportação XLSX (sem colunas técnicas) =====
     drop_cols = [c for c in ["_pub_raw", "_fim_raw", "_pub_dt", "_orgao_cnpj", "_ano", "_seq", "_id"] if c in df.columns]
     export_df = df.drop(columns=[c for c in drop_cols if c in df.columns]).copy()
     xlsx_buf = io.BytesIO()

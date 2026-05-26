@@ -104,10 +104,6 @@ def _full_url(item_url: str) -> str:
     return ORIGIN.rstrip("/") + "/" + str(item_url).lstrip("/")
 
 def _build_pncp_link(item: Dict) -> str:
-    """
-    Preferência: https://pncp.gov.br/app/editais/{orgao_cnpj}/{ano}/{numero_sequencial}
-    Fallback: corrige caminhos /compras/ -> /app/editais/.
-    """
     cnpj = str(item.get("orgao_cnpj", "") or "").strip()
     ano = str(item.get("ano", "") or "").strip()
     seq = str(item.get("numero_sequencial", "") or "").strip()
@@ -150,17 +146,23 @@ def _gh_headers() -> Dict[str, str]:
     }
 
 def _gh_cfg_ok() -> bool:
-    return bool(st.secrets.get("GITHUB_TOKEN") and st.secrets.get("GITHUB_REPO"))
+    # Aceita tanto variáveis padrão quanto as de teste
+    has_repo = bool(st.secrets.get("GITHUB_REPO_TEST") or st.secrets.get("GITHUB_REPO"))
+    return bool(st.secrets.get("GITHUB_TOKEN") and has_repo)
 
 def _gh_paths(filename: str) -> Tuple[str, str, str]:
-    repo   = st.secrets["GITHUB_REPO"]
-    branch = st.secrets.get("GITHUB_BRANCH", "main")
-    based  = st.secrets.get("GITHUB_BASEDIR", "data")
-    path   = f"{based.rstrip('/')}/{filename}"
+    # Prioriza pasta/repo de teste (clone) quando disponível
+    repo = st.secrets.get("GITHUB_REPO_TEST") or st.secrets.get("GITHUB_REPO")
+    branch = st.secrets.get("GITHUB_BRANCH_TEST") or st.secrets.get("GITHUB_BRANCH", "main")
+    based = (st.secrets.get("GITHUB_BASEDIR_TEST")
+             if st.secrets.get("GITHUB_BASEDIR_TEST") is not None
+             else st.secrets.get("GITHUB_BASEDIR", "data"))
+    based = str(based).strip()
+
+    path = f"{based.rstrip('/')}/{filename}" if based else filename
     return repo, branch, path
 
 def _gh_get_json(filename: str) -> Tuple[Optional[dict], Optional[str]]:
-    """Retorna (conteudo_json, sha) ou (None, None) se não existir."""
     if not _gh_cfg_ok():
         return None, None
     repo, branch, path = _gh_paths(filename)
@@ -179,7 +181,6 @@ def _gh_get_json(filename: str) -> Tuple[Optional[dict], Optional[str]]:
         return None, sha
 
 def _gh_put_json(filename: str, payload: dict, sha: Optional[str]) -> None:
-    """Cria/atualiza arquivo com commit. Se sha for None, cria; senão atualiza."""
     if not _gh_cfg_ok():
         return
     repo, branch, path = _gh_paths(filename)
@@ -201,9 +202,6 @@ def _gh_put_json(filename: str, payload: dict, sha: Optional[str]) -> None:
     r = requests.put(url, headers=_gh_headers(), json=data, timeout=30)
     r.raise_for_status()
 
-# ==========================
-# Loaders locais + GitHub (híbridos)
-# ==========================
 @st.cache_data(show_spinner=False)
 def load_municipios_pncp() -> pd.DataFrame:
     encodings = ["utf-8", "utf-8-sig", "latin1", "cp1252"]
@@ -227,7 +225,7 @@ def load_municipios_pncp() -> pd.DataFrame:
                             continue
                         col_nome, col_codigo, col_uf = _guess_columns(df)
                         if not col_nome or not col_codigo:
-                            raise ValueError("Não foi possível detectar colunas de 'Municipio' (nome) e 'id' (código PNCP).")
+                            raise ValueError("Não foi possível detectar colunas de 'Municipio' e 'id'.")
                         out = pd.DataFrame({
                             "nome": df[col_nome].astype(str).str.strip(),
                             "codigo_pncp": df[col_codigo].astype(str).str.strip(),
@@ -241,7 +239,7 @@ def load_municipios_pncp() -> pd.DataFrame:
                         continue
     if last_err:
         raise last_err
-    raise FileNotFoundError("ListaMunicipiosPNCP.csv não encontrada em ./data ou na raiz do projeto.")
+    raise FileNotFoundError("ListaMunicipiosPNCP.csv não encontrada em ./data ou raiz do projeto.")
 
 @st.cache_data(show_spinner=False)
 def load_ibge_catalog() -> Optional[pd.DataFrame]:
@@ -287,7 +285,7 @@ def _persist_saved_searches(d: Dict[str, Dict]):
         _gh_put_json("saved_searches.json", d, sha)
         return
     except Exception as e:
-        st.warning(f"Não consegui salvar no GitHub (usando fallback local): {e}")
+        st.warning(f"Não consegui salvar no GitHub (fallback local): {e}")
     try:
         with open(SAVED_SEARCHES_PATH, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=2)
@@ -311,16 +309,13 @@ def _persist_marks(path: str, remote_name: str, d: Dict[str, bool]):
         _gh_put_json(remote_name, d, sha)
         return
     except Exception as e:
-        st.warning(f"Não consegui salvar no GitHub (usando fallback local): {e}")
+        st.warning(f"Não consegui salvar no GitHub (fallback local): {e}")
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=2)
     except Exception as e:
         st.error(f"Falha ao salvar marcações localmente: {e}")
 
-# ==========================
-# Coleta PNCP (corrigida sem alterar fluxo do app)
-# ==========================
 def consultar_pncp_por_municipio(
     municipio_id: str,
     status_value: str = "recebendo_proposta",
@@ -341,29 +336,23 @@ def consultar_pncp_por_municipio(
             params["status"] = status_value
 
         r = requests.get(BASE_API, params=params, headers=HEADERS, timeout=30)
-
-        # mantém raise para HTTP error, mas evita quebra de JSON decode em respostas não JSON
         r.raise_for_status()
 
         body = (r.text or "").strip()
         if not body:
-            break  # resposta vazia => sem itens
+            break
 
         content_type = (r.headers.get("Content-Type") or "").lower()
         looks_like_json = body.startswith("{") or body.startswith("[")
-
         if "json" not in content_type and not looks_like_json:
-            # endpoint respondeu HTML/texto; tratamos como sem dados para não derrubar a busca
             break
 
         try:
             js = r.json()
         except ValueError:
-            # JSON inválido; evita crash "Expecting value..."
             break
 
         itens = _items_from_json(js)
-
         if not itens:
             break
 
@@ -420,18 +409,15 @@ def montar_registro(item: Dict, municipio_codigo: str) -> Dict:
         "_id": raw_id,
     }
 
-# ==========================
-# Estado
-# ==========================
 def _ensure_session_state():
     if "selected_municipios" not in st.session_state:
-        st.session_state.selected_municipios = []  # list[{codigo_pncp,nome,uf}]
+        st.session_state.selected_municipios = []
     if "saved_searches" not in st.session_state:
         st.session_state.saved_searches = _load_saved_searches()
     if "sidebar_inputs" not in st.session_state:
         st.session_state.sidebar_inputs = {
             "palavra_chave": "",
-            "status_label": STATUS_LABELS[0],  # default
+            "status_label": STATUS_LABELS[0],
             "uf": UF_PLACEHOLDER,
             "save_name": "",
             "selected_saved": None,
@@ -445,7 +431,7 @@ def _ensure_session_state():
     if "page_size_cards" not in st.session_state:
         st.session_state.page_size_cards = 10
     if "results_df" not in st.session_state:
-        st.session_state.results_df = None  # list[dict]
+        st.session_state.results_df = None
     if "results_signature" not in st.session_state:
         st.session_state.results_signature = None
     if "tr_marks" not in st.session_state:
@@ -453,12 +439,8 @@ def _ensure_session_state():
     if "na_marks" not in st.session_state:
         st.session_state.na_marks = _load_marks(SAVED_NA_PATH, "na_marks.json")
 
-# ==========================
-# Coleta agregada (CACHE)
-# ==========================
 @st.cache_data(ttl=900, show_spinner=False)
 def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
-    """Coleção consolidada por assinatura de filtros (municípios, status, q)."""
     registros: List[Dict] = []
     codigos = signature.get("municipios", [])
     status_value = signature.get("status", "")
@@ -473,8 +455,6 @@ def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
             registros.append(montar_registro(it, codigo))
 
     df = pd.DataFrame(registros)
-
-    # Filtro client-side por palavra-chave (título/objeto)
     q = (signature.get("q") or "").strip()
     if q and not df.empty:
         mask = (
@@ -483,7 +463,6 @@ def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
         )
         df = df[mask].copy()
 
-    # Ordenação por data de publicação (desc)
     try:
         df["_pub_dt"] = pd.to_datetime(df["_pub_raw"], errors="coerce", utc=False)
     except Exception:
@@ -491,6 +470,12 @@ def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
     df.sort_values("_pub_dt", ascending=False, na_position="last", inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
+
+# (demais funções de sidebar/UI idênticas ao seu original)
+# mantenha daqui para baixo exatamente como está no seu arquivo atual
+
+if __name__ == "__main__":
+    main()
 
 # ==========================
 # Sidebar (reativa)

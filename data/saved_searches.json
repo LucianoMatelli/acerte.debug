@@ -1,0 +1,646 @@
+{
+  "Docelandia": {
+    "palavra_chave": "",
+    "status_label": "A Receber/Recebendo Proposta",
+    "uf": "SP",
+    "municipios": [
+      {
+        "codigo_pncp": "3523",
+        "nome": "Itapetininga",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3359",
+        "nome": "Buri",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3721",
+        "nome": "Porto Feliz",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3405",
+        "nome": "Conchas",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3878",
+        "nome": "Torre de Pedra",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3720",
+        "nome": "Porangaba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3477",
+        "nome": "Guareí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3735",
+        "nome": "Quadra",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3292",
+        "nome": "Angatuba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3385",
+        "nome": "Capão Bonito",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3375",
+        "nome": "Campina do Monte Alegre",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3694",
+        "nome": "Pilar do Sul",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3838",
+        "nome": "Sarapuí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3386",
+        "nome": "Capela do Alto",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3829",
+        "nome": "São Miguel Arcanjo",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3399",
+        "nome": "Cesário Lange",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3533",
+        "nome": "Itararé",
+        "uf": ""
+      }
+    ]
+  },
+  "Papelaria": {
+    "palavra_chave": "Escritório",
+    "status_label": "A Receber/Recebendo Proposta",
+    "uf": "SP",
+    "municipios": [
+      {
+        "codigo_pncp": "3523",
+        "nome": "Itapetininga",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3292",
+        "nome": "Angatuba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3345",
+        "nome": "Bofete",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3359",
+        "nome": "Buri",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3346",
+        "nome": "Boituva",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3385",
+        "nome": "Capão Bonito",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3398",
+        "nome": "Cerquilho",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3399",
+        "nome": "Cesário Lange",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3405",
+        "nome": "Conchas",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3375",
+        "nome": "Campina do Monte Alegre",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3477",
+        "nome": "Guareí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3524",
+        "nome": "Itapeva",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3566",
+        "nome": "Laranjal Paulista",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3690",
+        "nome": "Pereiras",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3693",
+        "nome": "Piedade",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3694",
+        "nome": "Pilar do Sul",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3721",
+        "nome": "Porto Feliz",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3720",
+        "nome": "Porangaba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3670",
+        "nome": "Paranapanema",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3735",
+        "nome": "Quadra",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3829",
+        "nome": "São Miguel Arcanjo",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3838",
+        "nome": "Sarapuí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3775",
+        "nome": "Salto",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3878",
+        "nome": "Torre de Pedra",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3871",
+        "nome": "Tatuí",
+        "uf": ""
+      }
+    ]
+  },
+  "Docelandia (antiga)": {
+    "palavra_chave": "",
+    "status_label": "A Receber/Recebendo Proposta",
+    "uf": "SP",
+    "municipios": [
+      {
+        "codigo_pncp": "3876",
+        "nome": "Tietê",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3398",
+        "nome": "Cerquilho",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3871",
+        "nome": "Tatuí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3346",
+        "nome": "Boituva",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3670",
+        "nome": "Paranapanema",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3524",
+        "nome": "Itapeva",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3300",
+        "nome": "Araçoiaba da Serra",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3508",
+        "nome": "Iperó",
+        "uf": ""
+      }
+    ]
+  },
+  "Jo Ovos (Perto)": {
+    "palavra_chave": "",
+    "status_label": "A Receber/Recebendo Proposta",
+    "uf": "SP",
+    "municipios": [
+      {
+        "codigo_pncp": "3838",
+        "nome": "Sarapuí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3477",
+        "nome": "Guareí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3829",
+        "nome": "São Miguel Arcanjo",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3735",
+        "nome": "Quadra",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3871",
+        "nome": "Tatuí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3386",
+        "nome": "Capela do Alto",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3292",
+        "nome": "Angatuba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3878",
+        "nome": "Torre de Pedra",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3399",
+        "nome": "Cesário Lange",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3694",
+        "nome": "Pilar do Sul",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3375",
+        "nome": "Campina do Monte Alegre",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3508",
+        "nome": "Iperó",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3300",
+        "nome": "Araçoiaba da Serra",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3720",
+        "nome": "Porangaba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3776",
+        "nome": "Salto de Pirapora",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3359",
+        "nome": "Buri",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3346",
+        "nome": "Boituva",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3398",
+        "nome": "Cerquilho",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3566",
+        "nome": "Laranjal Paulista",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3690",
+        "nome": "Pereiras",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3405",
+        "nome": "Conchas",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3693",
+        "nome": "Piedade",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3849",
+        "nome": "Sorocaba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3908",
+        "nome": "Votorantim",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3523",
+        "nome": "Itapetininga",
+        "uf": ""
+      }
+    ]
+  },
+  "Jo Ovos (Longe)": {
+    "palavra_chave": "",
+    "status_label": "A Receber/Recebendo Proposta",
+    "uf": "SP",
+    "municipios": [
+      {
+        "codigo_pncp": "3863",
+        "nome": "Tapiraí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3536",
+        "nome": "Itatinga",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3385",
+        "nome": "Capão Bonito",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3721",
+        "nome": "Porto Feliz",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3876",
+        "nome": "Tietê",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3587",
+        "nome": "Mairinque",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3833",
+        "nome": "São Roque",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3540",
+        "nome": "Itu",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3524",
+        "nome": "Itapeva",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3753",
+        "nome": "Ribeirão Grande",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3468",
+        "nome": "Guapiara",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3868",
+        "nome": "Taquarivaí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3636",
+        "nome": "Nova Campina",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3670",
+        "nome": "Paranapanema",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3517",
+        "nome": "Itaí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3319",
+        "nome": "Avaré",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3516",
+        "nome": "Itaberá",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3756",
+        "nome": "Riversul",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3529",
+        "nome": "Itaporanga",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3867",
+        "nome": "Taquarituba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3408",
+        "nome": "Coronel Macedo",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3444",
+        "nome": "Fartura",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3858",
+        "nome": "Taguaí",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3298",
+        "nome": "Araçariguama",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3345",
+        "nome": "Bofete",
+        "uf": ""
+      }
+    ]
+  },
+  "Jo Ovos (SP)": {
+    "palavra_chave": "horti",
+    "status_label": "A Receber/Recebendo Proposta",
+    "uf": "SP",
+    "municipios": [
+      {
+        "codigo_pncp": "3830",
+        "nome": "São Paulo",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3655",
+        "nome": "Osasco",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3332",
+        "nome": "Barueri",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3389",
+        "nome": "Carapicuíba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3796",
+        "nome": "Santana de Parnaíba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3298",
+        "nome": "Araçariguama",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3551",
+        "nome": "Jandira",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3525",
+        "nome": "Itapevi",
+        "uf": ""
+      }
+    ]
+  },
+  "P&H - Descartável": {
+    "palavra_chave": "",
+    "status_label": "A Receber/Recebendo Proposta",
+    "uf": "SP",
+    "municipios": [
+      {
+        "codigo_pncp": "3908",
+        "nome": "Votorantim",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3849",
+        "nome": "Sorocaba",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3833",
+        "nome": "São Roque",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3587",
+        "nome": "Mairinque",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3693",
+        "nome": "Piedade",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3775",
+        "nome": "Salto",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3540",
+        "nome": "Itu",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3776",
+        "nome": "Salto de Pirapora",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3363",
+        "nome": "Cabreúva",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3493",
+        "nome": "Ibiúna",
+        "uf": ""
+      },
+      {
+        "codigo_pncp": "3871",
+        "nome": "Tatuí",
+        "uf": ""
+      }
+    ]
+  }
+}

@@ -41,6 +41,21 @@ CSV_IBGE_PATHS = [
 SAVED_SEARCHES_PATH = os.path.join(BASE_DIR, "saved_searches.json")
 SAVED_TR_PATH = os.path.join(BASE_DIR, "tr_marks.json")
 SAVED_NA_PATH = os.path.join(BASE_DIR, "na_marks.json")
+SAVED_SEARCHES_PATHS = [
+    os.path.join(DATA_DIR, "saved_searches.json"),
+    SAVED_SEARCHES_PATH,
+]
+SAVED_TR_PATHS = [
+    os.path.join(DATA_DIR, "tr_marks.json"),
+    SAVED_TR_PATH,
+]
+SAVED_NA_PATHS = [
+    os.path.join(DATA_DIR, "na_marks.json"),
+    SAVED_NA_PATH,
+]
+DEFAULT_GITHUB_REPO = "LucianoMatelli/acerte.debug"
+DEFAULT_GITHUB_BRANCH = "main"
+DEFAULT_GITHUB_BASEDIR = "data"
 
 ORIGIN = "https://pncp.gov.br"
 BASE_API_CONSULTA = ORIGIN + "/api/consulta/v1"
@@ -223,6 +238,79 @@ def _uid_from_row(row: Dict) -> str:
 # ==========================
 # Persistência via GitHub Contents API
 # ==========================
+def _infer_repo_from_git_config() -> str:
+    try:
+        git_cfg = os.path.join(BASE_DIR, ".git", "config")
+        if not os.path.exists(git_cfg):
+            return ""
+        with open(git_cfg, "r", encoding="utf-8") as f:
+            txt = f.read()
+        m = re.search(r"url\s*=\s*(.+github\.com[:/][^/\s]+/[^/\s]+)(?:\.git)?", txt, flags=re.IGNORECASE)
+        if not m:
+            return ""
+        url = m.group(1).strip().replace("\\", "/")
+        m2 = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$", url, flags=re.IGNORECASE)
+        return m2.group(1) if m2 else ""
+    except Exception:
+        return ""
+
+
+def _gh_repo_resolved() -> str:
+    return (
+        str(st.secrets.get("GITHUB_REPO_TEST") or "").strip()
+        or str(st.secrets.get("GITHUB_REPO") or "").strip()
+        or str(os.getenv("GITHUB_REPOSITORY", "")).strip()
+        or _infer_repo_from_git_config()
+        or DEFAULT_GITHUB_REPO
+    )
+
+
+def _gh_branch_resolved() -> str:
+    return (
+        str(st.secrets.get("GITHUB_BRANCH_TEST") or "").strip()
+        or str(st.secrets.get("GITHUB_BRANCH") or "").strip()
+        or DEFAULT_GITHUB_BRANCH
+    )
+
+
+def _gh_basedir_resolved() -> str:
+    based_test = st.secrets.get("GITHUB_BASEDIR_TEST")
+    if based_test is not None:
+        return str(based_test).strip()
+    return str(st.secrets.get("GITHUB_BASEDIR", DEFAULT_GITHUB_BASEDIR)).strip()
+
+
+def _read_json_from_paths(paths: List[str]) -> Optional[dict]:
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    js = json.load(f)
+                if isinstance(js, dict):
+                    return js
+        except Exception:
+            continue
+    return None
+
+
+def _write_json_to_paths(paths: List[str], payload: dict) -> None:
+    alvo = ""
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                alvo = p
+                break
+        except Exception:
+            continue
+    if not alvo:
+        alvo = paths[0]
+    parent = os.path.dirname(alvo)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+    with open(alvo, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def _gh_headers() -> Dict[str, str]:
     h = {
         "Accept": "application/vnd.github+json",
@@ -235,17 +323,12 @@ def _gh_headers() -> Dict[str, str]:
     return h
 
 def _gh_cfg_ok() -> bool:
-    has_repo = bool(st.secrets.get("GITHUB_REPO_TEST") or st.secrets.get("GITHUB_REPO"))
-    return has_repo
+    return bool(_gh_repo_resolved())
 
 def _gh_paths(filename: str) -> Tuple[str, str, str]:
-    repo = st.secrets.get("GITHUB_REPO_TEST") or st.secrets.get("GITHUB_REPO")
-    branch = st.secrets.get("GITHUB_BRANCH_TEST") or st.secrets.get("GITHUB_BRANCH", "main")
-    based_test = st.secrets.get("GITHUB_BASEDIR_TEST")
-    if based_test is not None:
-        based = str(based_test).strip()
-    else:
-        based = str(st.secrets.get("GITHUB_BASEDIR", "data")).strip()
+    repo = _gh_repo_resolved()
+    branch = _gh_branch_resolved()
+    based = _gh_basedir_resolved()
     path = f"{based.rstrip('/')}/{filename}" if based else filename
     return repo, branch, path
 
@@ -260,21 +343,27 @@ def _gh_get_json(filename: str) -> Tuple[Optional[dict], Optional[str]]:
     except Exception:
         return None, None
 
-    if r.status_code == 404:
-        return None, None
-    if r.status_code in (401, 403):
-        return None, None
-    if r.status_code >= 400:
-        return None, None
+    if 200 <= r.status_code < 300:
+        try:
+            js = r.json()
+            content_b64 = js.get("content", "")
+            sha = js.get("sha")
+            raw = base64.b64decode(content_b64).decode("utf-8")
+            parsed = json.loads(raw)
+            return (parsed if isinstance(parsed, dict) else None), sha
+        except Exception:
+            pass
 
+    # Fallback de leitura para repositório público
     try:
-        js = r.json()
-        content_b64 = js.get("content", "")
-        sha = js.get("sha")
-        raw = base64.b64decode(content_b64).decode("utf-8")
-        return json.loads(raw), sha
+        raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+        rr = requests.get(raw_url, headers={"User-Agent": "AcerteLicitacoes/PNCP"}, timeout=20)
+        if rr.status_code == 200:
+            parsed = json.loads(rr.text)
+            return (parsed if isinstance(parsed, dict) else None), None
     except Exception:
-        return None, None
+        pass
+    return None, None
 
 def _gh_put_json(filename: str, payload: dict, sha: Optional[str]) -> None:
     if not _gh_cfg_ok():
@@ -391,15 +480,60 @@ def load_ibge_catalog() -> Optional[pd.DataFrame]:
                         continue
     return None
 
+
+@st.cache_data(ttl=604800, show_spinner=False)
+def _ibge_mapa_uf_online(uf: str) -> Dict[str, str]:
+    uf_up = str(uf or "").strip().upper()
+    if len(uf_up) != 2:
+        return {}
+    try:
+        url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf_up}/municipios"
+        r = requests.get(url, headers={"User-Agent": "AcerteLicitacoes/PNCP"}, timeout=20)
+        if r.status_code >= 400:
+            return {}
+        js = r.json()
+    except Exception:
+        return {}
+    out: Dict[str, str] = {}
+    if not isinstance(js, list):
+        return out
+    for it in js:
+        try:
+            nome = str(it.get("nome") or "").strip()
+            cod = str(it.get("id") or "").strip()
+            if nome and cod.isdigit():
+                out[_norm(nome)] = cod
+        except Exception:
+            continue
+    return out
+
+
+def _resolver_codigo_ibge(municipio_nome: str, uf: str, ibge_df: Optional[pd.DataFrame]) -> str:
+    nome_norm = _norm(municipio_nome)
+    uf_up = str(uf or "").strip().upper()
+    if not nome_norm or len(uf_up) != 2:
+        return ""
+
+    if ibge_df is not None and {"uf", "municipio_norm", "codigo_ibge"}.issubset(set(ibge_df.columns)):
+        try:
+            hit = ibge_df[(ibge_df["uf"] == uf_up) & (ibge_df["municipio_norm"] == nome_norm)]
+            if not hit.empty:
+                cod = str(hit.iloc[0].get("codigo_ibge") or "").strip()
+                if cod.isdigit():
+                    return cod
+        except Exception:
+            pass
+
+    mapa_online = _ibge_mapa_uf_online(uf_up)
+    cod_online = str(mapa_online.get(nome_norm) or "").strip()
+    return cod_online if cod_online.isdigit() else ""
+
 def _load_saved_searches() -> Dict[str, Dict]:
     js, _ = _gh_get_json("saved_searches.json")
     if isinstance(js, dict):
         return js
-    try:
-        with open(SAVED_SEARCHES_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    local = _read_json_from_paths(SAVED_SEARCHES_PATHS)
+    return local if isinstance(local, dict) else {}
 
 def _persist_saved_searches(d: Dict[str, Dict]):
     try:
@@ -409,8 +543,7 @@ def _persist_saved_searches(d: Dict[str, Dict]):
     except Exception as e:
         st.warning(f"Não consegui salvar no GitHub (usando fallback local): {e}")
     try:
-        with open(SAVED_SEARCHES_PATH, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
+        _write_json_to_paths(SAVED_SEARCHES_PATHS, d)
     except Exception as e:
         st.error(f"Falha ao salvar pesquisas localmente: {e}")
 
@@ -418,12 +551,13 @@ def _load_marks(path: str, remote_name: str) -> Dict[str, bool]:
     js, _ = _gh_get_json(remote_name) if _gh_cfg_ok() else (None, None)
     if isinstance(js, dict):
         return {str(k): bool(v) for k, v in js.items()}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return {str(k): bool(v) for k, v in data.items()} if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    local_paths = [path]
+    if remote_name == "tr_marks.json":
+        local_paths = SAVED_TR_PATHS
+    elif remote_name == "na_marks.json":
+        local_paths = SAVED_NA_PATHS
+    data = _read_json_from_paths(local_paths)
+    return {str(k): bool(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
 def _persist_marks(path: str, remote_name: str, d: Dict[str, bool]):
     try:
@@ -433,8 +567,12 @@ def _persist_marks(path: str, remote_name: str, d: Dict[str, bool]):
     except Exception as e:
         st.warning(f"Não consegui salvar no GitHub (usando fallback local): {e}")
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
+        local_paths = [path]
+        if remote_name == "tr_marks.json":
+            local_paths = SAVED_TR_PATHS
+        elif remote_name == "na_marks.json":
+            local_paths = SAVED_NA_PATHS
+        _write_json_to_paths(local_paths, d)
     except Exception as e:
         st.error(f"Falha ao salvar marcações localmente: {e}")
 
@@ -484,17 +622,21 @@ def _status_compativel_consulta(status_value: str, situacao_id: Optional[int], d
     proposta_encerrada = bool(pd.notna(fim) and fim < agora)
 
     if status_value == "recebendo_proposta":
-        return situacao_id == 1 and proposta_aberta
+        if situacao_id in {2, 3, 4}:
+            return False
+        return proposta_aberta
 
     if status_value == "em_julgamento":
         # Aproximação necessária no domínio de contratações:
         # proposta já encerrou, mas contratação ainda divulgada.
-        return situacao_id == 1 and proposta_encerrada
+        if situacao_id in {2, 3, 4}:
+            return False
+        return proposta_encerrada
 
     if status_value == "encerrado":
         if situacao_id in {2, 3, 4}:
             return True
-        return situacao_id is not None and situacao_id != 1
+        return proposta_encerrada
 
     return True
 
@@ -1159,9 +1301,6 @@ def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
             )
         except Exception:
             itens = []
-        if not codigo_ibge and not itens:
-            # Evita falso "zerado" por falta de código IBGE no novo endpoint oficial.
-            continue
         for it in itens:
             registros.append(montar_registro(it, codigo, nome, uf))
 
@@ -1492,7 +1631,15 @@ def main():
                     m["codigo_ibge"] = by_pncp
                 else:
                     chave = (str(m.get("uf") or "").strip().upper(), _norm(str(m.get("nome") or "")))
-                    m["codigo_ibge"] = str(mapa_ibge_uf_nome.get(chave, "") or "").strip()
+                    by_ibge_catalog = str(mapa_ibge_uf_nome.get(chave, "") or "").strip()
+                    if by_ibge_catalog:
+                        m["codigo_ibge"] = by_ibge_catalog
+                    else:
+                        m["codigo_ibge"] = _resolver_codigo_ibge(
+                            municipio_nome=str(m.get("nome") or ""),
+                            uf=str(m.get("uf") or ""),
+                            ibge_df=ibge_df,
+                        )
 
     status_value = STATUS_MAP.get(st.session_state.sidebar_inputs["status_label"], "")
     palavra_chave = (st.session_state.sidebar_inputs["palavra_chave"] or "").strip()
@@ -1663,3 +1810,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -50,6 +50,7 @@ BASE_API_ORGAOS = ORIGIN + "/pncp-api/v1/orgaos/"
 BASE_API_ARQUIVOS = ORIGIN + "/pncp-api/v1/orgaos/{cnpj}/compras/{ano}/{seq}/arquivos"
 BASE_API_ITENS = ORIGIN + "/pncp-api/v1/orgaos/{cnpj}/compras/{ano}/{seq}/itens"
 BASE_API_MODALIDADES = ORIGIN + "/pncp-api/v1/modalidades"
+BASE_API_DADOS_ABERTOS_14133 = "https://dadosabertos.compras.gov.br/modulo-contratacoes/1_consultarContratacoes_PNCP_14133"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Referer": "https://pncp.gov.br/app/editais",
@@ -69,6 +70,8 @@ MAX_SEQ_SCAN = 180
 MISS_STREAK_STOP = 40
 MAX_ORGAOS_POR_MUNICIPIO = 8
 MODALIDADES_PADRAO = list(range(1, 14))
+INCLUIR_PODER_LEGISLATIVO = True
+DADOS_ABERTOS_MAX_DIAS = 365
 
 STATUS_LABELS = [
     "A Receber/Recebendo Proposta",
@@ -95,6 +98,25 @@ def _secret_int(name: str, default: int) -> int:
         return default
 
 
+def _secret_int_list(name: str, default: List[int]) -> List[int]:
+    raw = str(st.secrets.get(name, "") or "").strip()
+    if not raw:
+        return list(default)
+    out: List[int] = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            v = int(p)
+        except Exception:
+            continue
+        if v > 0:
+            out.append(v)
+    uniq = sorted(set(out))
+    return uniq if uniq else list(default)
+
+
 CFG_ANOS_LOOKBACK = _secret_int("PNCP_ANOS_LOOKBACK", ANOS_LOOKBACK)
 CFG_MAX_SEQ_SCAN = _secret_int("PNCP_MAX_SEQ_SCAN", MAX_SEQ_SCAN)
 CFG_MISS_STREAK_STOP = _secret_int("PNCP_MISS_STREAK_STOP", MISS_STREAK_STOP)
@@ -115,8 +137,22 @@ CFG_CONSULTA_MAX_ERROS_CONSECUTIVOS = _secret_int(
     "PNCP_CONSULTA_MAX_ERROS_CONSECUTIVOS",
     CONSULTA_MAX_ERROS_CONSECUTIVOS,
 )
-# Mantido fixo em False para evitar mistura de campos com o fluxo legado de varredura.
-CFG_ENABLE_FALLBACK_SCAN = False
+CFG_ENABLE_FALLBACK_SCAN = str(st.secrets.get("PNCP_ENABLE_FALLBACK_SCAN", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+CFG_INCLUIR_PODER_LEGISLATIVO = str(
+    st.secrets.get("PNCP_INCLUIR_PODER_LEGISLATIVO", str(INCLUIR_PODER_LEGISLATIVO).lower())
+).strip().lower() in {"1", "true", "yes", "on"}
+CFG_DA_DIAS_PUBLICACAO = min(
+    DADOS_ABERTOS_MAX_DIAS,
+    _secret_int("PNCP_DA_DIAS_PUBLICACAO", DADOS_ABERTOS_MAX_DIAS),
+)
+CFG_DA_TAM_PAGINA = min(500, _secret_int("PNCP_DA_TAM_PAGINA", 200))
+CFG_DA_MAX_PAGINAS_MODALIDADE = _secret_int("PNCP_DA_MAX_PAGINAS_MODALIDADE", CFG_CONSULTA_MAX_PAGINAS_MODALIDADE)
+CFG_DA_MODALIDADES = _secret_int_list("PNCP_DA_MODALIDADES", MODALIDADES_PADRAO)
 
 
 def _norm(s: str) -> str:
@@ -444,48 +480,46 @@ def _status_compativel_consulta(status_value: str, situacao_id: Optional[int], d
     fim = pd.to_datetime(data_encerramento, errors="coerce", utc=True)
     if pd.notna(fim):
         fim = fim.tz_localize(None)
-    is_fechada_data = bool(pd.notna(fim) and fim < agora)
+    proposta_aberta = bool(pd.isna(fim) or fim >= agora)
+    proposta_encerrada = bool(pd.notna(fim) and fim < agora)
 
     if status_value == "recebendo_proposta":
-        # Manual 6.4: propostas em aberto.
-        # Regras práticas: situação divulgada (1) e fim de recebimento >= agora.
-        if pd.isna(fim):
-            return False
-        if situacao_id is not None and int(situacao_id) != 1:
-            return False
-        return bool(fim >= agora)
+        return situacao_id == 1 and proposta_aberta
 
     if status_value == "em_julgamento":
-        # Não existe status explícito "em julgamento" no domínio da contratação.
-        # Aproximação: já encerrou proposta, mas contratação segue divulgada (1).
-        return situacao_id == 1 and is_fechada_data
+        # Aproximação necessária no domínio de contratações:
+        # proposta já encerrou, mas contratação ainda divulgada.
+        return situacao_id == 1 and proposta_encerrada
 
     if status_value == "encerrado":
-        if situacao_id in {2, 3, 4}:  # revogada/anulada/suspensa
+        if situacao_id in {2, 3, 4}:
             return True
-        return is_fechada_data and situacao_id not in {1}
+        return situacao_id is not None and situacao_id != 1
 
     return True
 
 
-def _consulta_get_items(url: str, params: Dict) -> Tuple[List[Dict], Optional[str], Dict[str, int]]:
+def _consulta_dados_abertos_get_items(params: Dict) -> Tuple[List[Dict], Optional[str], Dict[str, int]]:
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=CFG_CONSULTA_TIMEOUT_HTTP)
+        r = requests.get(BASE_API_DADOS_ABERTOS_14133, params=params, headers=HEADERS, timeout=CFG_CONSULTA_TIMEOUT_HTTP)
     except Exception as e:
         return [], f"request_error:{e}", {}
 
-    if r.status_code in (204, 404):
+    if r.status_code == 404:
+        return [], None, {}
+    if r.status_code == 204:
         return [], None, {}
     if r.status_code >= 400:
-        return [], f"http_{r.status_code}", {}
+        body = (r.text or "").strip()
+        return [], f"http_{r.status_code}:{body[:180]}", {}
 
     body = (r.text or "").strip()
     ctype = (r.headers.get("content-type") or "").lower()
     if "json" not in ctype and not body.startswith("{") and not body.startswith("["):
-        return [], "non_json", {}
+        return [], f"non_json:{body[:120]}", {}
 
     try:
-        js = r.json()
+        js = json.loads(body)
     except Exception as e:
         return [], f"json_error:{e}", {}
 
@@ -497,11 +531,11 @@ def _consulta_get_items(url: str, params: Dict) -> Tuple[List[Dict], Optional[st
         except Exception:
             pass
         try:
-            if js.get("numeroPagina") is not None:
-                meta["numeroPagina"] = int(js.get("numeroPagina"))
+            if js.get("paginasRestantes") is not None:
+                meta["paginasRestantes"] = int(js.get("paginasRestantes"))
         except Exception:
             pass
-    itens = js if isinstance(js, list) else _items_from_json(js)
+    itens = js.get("resultado", []) if isinstance(js, dict) else _items_from_json(js)
     return (itens if isinstance(itens, list) else []), None, meta
 
 
@@ -512,18 +546,10 @@ def _consultar_pncp_api_consulta(
     municipio_ibge: str,
     status_value: str,
 ) -> List[Dict]:
-    modalidades = _listar_modalidades_ids()
-    data_final = datetime.now().strftime("%Y%m%d")
-    data_inicial = (datetime.now() - timedelta(days=CFG_CONSULTA_DIAS_PUBLICACAO)).strftime("%Y%m%d")
-    dt_inicial = pd.Timestamp(datetime.now() - timedelta(days=CFG_CONSULTA_DIAS_PUBLICACAO))
-
-    endpoint = BASE_API_CONSULTA_PUBLICACAO
-    endpoint_is_proposta = False
-    if status_value == "recebendo_proposta":
-        endpoint = BASE_API_CONSULTA_PROPOSTA
-        endpoint_is_proposta = True
-
-    mun_norm = _norm(municipio_nome)
+    modalidades = CFG_DA_MODALIDADES
+    dias = max(1, min(CFG_DA_DIAS_PUBLICACAO, DADOS_ABERTOS_MAX_DIAS))
+    data_final = datetime.now().strftime("%Y-%m-%d")
+    data_inicial = (datetime.now() - timedelta(days=dias)).strftime("%Y-%m-%d")
     resultados: List[Dict] = []
     vistos = set()
     teve_resposta_consulta = False
@@ -559,22 +585,19 @@ def _consultar_pncp_api_consulta(
             paginas_visitadas.add(pagina)
 
             params: Dict[str, str | int] = {
-                "codigoModalidadeContratacao": modalidade_id,
+                "codigoModalidade": modalidade_id,
                 "pagina": pagina,
-                "tamanhoPagina": CFG_CONSULTA_TAM_PAGINA,
+                "tamanhoPagina": CFG_DA_TAM_PAGINA,
+                "dataPublicacaoPncpInicial": data_inicial,
+                "dataPublicacaoPncpFinal": data_final,
             }
-            if endpoint_is_proposta:
-                params["dataFinal"] = data_final
-            else:
-                params["dataInicial"] = data_inicial
-                params["dataFinal"] = data_final
             if municipio_uf:
-                params["uf"] = str(municipio_uf).upper()
+                params["unidadeOrgaoUfSigla"] = str(municipio_uf).upper()
             if municipio_ibge:
-                params["codigoMunicipioIbge"] = str(municipio_ibge)
+                params["unidadeOrgaoCodigoIbge"] = str(municipio_ibge)
 
             req_count += 1
-            itens, err, meta = _consulta_get_items(endpoint, params)
+            itens, err, meta = _consulta_dados_abertos_get_items(params)
             if err:
                 erros_consecutivos += 1
                 if erros_consecutivos >= CFG_CONSULTA_MAX_ERROS_CONSECUTIVOS:
@@ -587,13 +610,8 @@ def _consultar_pncp_api_consulta(
             if pagina == 1:
                 total_paginas = int(meta.get("totalPaginas") or 0)
                 if total_paginas > 1:
-                    # Busca páginas iniciais e finais para mitigar ordenação instável do serviço.
-                    max_extra = max(1, CFG_CONSULTA_MAX_PAGINAS_MODALIDADE - 1)
-                    for p in range(2, min(total_paginas, 1 + max_extra) + 1):
-                        if p not in paginas_visitadas:
-                            paginas_planejadas.append(p)
-                    inicio_finais = max(2, total_paginas - max_extra + 1)
-                    for p in range(total_paginas, inicio_finais - 1, -1):
+                    max_pag = min(total_paginas, max(1, CFG_DA_MAX_PAGINAS_MODALIDADE))
+                    for p in range(2, max_pag + 1):
                         if p not in paginas_visitadas:
                             paginas_planejadas.append(p)
 
@@ -601,50 +619,37 @@ def _consultar_pncp_api_consulta(
                 continue
 
             for item in itens:
-                unidade = item.get("unidadeOrgao") or {}
-                orgao = item.get("orgaoEntidade") or {}
-                cidade_api = str(unidade.get("municipioNome") or municipio_nome or "").strip()
-                uf_api = str(unidade.get("ufSigla") or municipio_uf or "").strip().upper()
-                ibge_api = str(unidade.get("codigoIbge") or "")
-
-                # Quando não houver código IBGE no catálogo local, filtra por nome/UF.
+                cidade_api = str(item.get("unidadeOrgaoMunicipioNome") or municipio_nome or "").strip()
+                uf_api = str(item.get("unidadeOrgaoUfSigla") or municipio_uf or "").strip().upper()
+                ibge_api = str(item.get("unidadeOrgaoCodigoIbge") or "")
+                if municipio_ibge and ibge_api and str(ibge_api) != str(municipio_ibge):
+                    continue
                 if not municipio_ibge:
-                    if mun_norm and _norm(cidade_api) != mun_norm:
-                        continue
                     if municipio_uf and uf_api and uf_api != str(municipio_uf).upper():
                         continue
-                else:
-                    if ibge_api and str(ibge_api) != str(municipio_ibge):
+                    if _norm(cidade_api) != _norm(municipio_nome):
                         continue
 
-                sit_id_raw = item.get("situacaoCompraId")
+                sit_id_raw = item.get("situacaoCompraIdPncp")
                 try:
                     sit_id = int(sit_id_raw) if sit_id_raw is not None else None
                 except Exception:
                     sit_id = None
-                data_enc = str(item.get("dataEncerramentoProposta") or "")
+                data_enc = str(item.get("dataEncerramentoPropostaPncp") or "")
                 data_pub_raw = _primeiro_valor(
                     item.get("dataPublicacaoPncp"),
-                    item.get("dataAtualizacao"),
-                    item.get("dataInclusao"),
+                    item.get("dataAtualizacaoPncp"),
+                    item.get("dataInclusaoPncp"),
                 )
-                dt_pub = pd.to_datetime(data_pub_raw, errors="coerce", utc=True)
-                if pd.notna(dt_pub):
-                    dt_pub = dt_pub.tz_localize(None)
-
-                # Segurança adicional: mantém janela de publicação para todos os status.
-                if pd.notna(dt_pub) and dt_pub < dt_inicial:
-                    continue
-
                 if not _status_compativel_consulta(status_value, sit_id, data_enc):
                     continue
 
                 numero_controle = str(item.get("numeroControlePNCP") or "")
                 cnpj, ano_ctrl, seq_ctrl = _parse_numero_controle_pncp(numero_controle)
                 if not cnpj:
-                    cnpj = str(orgao.get("cnpj") or "").strip()
-                ano = str(item.get("anoCompra") or ano_ctrl or "").strip()
-                seq = str(item.get("sequencialCompra") or seq_ctrl or "").strip()
+                    cnpj = str(item.get("orgaoEntidadeCnpj") or "").strip()
+                ano = str(item.get("anoCompraPncp") or ano_ctrl or "").strip()
+                seq = str(item.get("sequencialCompraPncp") or seq_ctrl or "").strip()
 
                 uid = f"{cnpj}-{ano}-{seq}" if cnpj and ano and seq else numero_controle
                 if uid and uid in vistos:
@@ -652,25 +657,23 @@ def _consultar_pncp_api_consulta(
                 if uid:
                     vistos.add(uid)
 
-                tipo_inst = str(item.get("tipoInstrumentoConvocatorioNome") or "").strip()
+                tipo_inst = str(item.get("tipoInstrumentoConvocatorioNome") or "Edital").strip()
                 numero_compra = str(item.get("numeroCompra") or "").strip()
+                processo = str(item.get("processo") or "").strip()
                 modalidade_nome = str(item.get("modalidadeNome") or "").strip()
-                modo_disputa_nome = str(item.get("modoDisputaNome") or "").strip()
-                situacao_compra_nome = str(item.get("situacaoCompraNome") or "").strip()
+                modo_disputa_nome = str(item.get("modoDisputaNomePncp") or "").strip()
+                situacao_compra_nome = str(item.get("situacaoCompraNomePncp") or "").strip()
                 objeto_compra = str(item.get("objetoCompra") or "").strip()
                 info_compl = str(item.get("informacaoComplementar") or "").strip()
 
                 if numero_compra and ano:
-                    titulo = f"{tipo_inst or 'Contratação'} nº {numero_compra}/{ano}".strip()
+                    titulo = f"{tipo_inst} n° {numero_compra}/{ano}".strip()
                 elif numero_compra:
-                    titulo = f"{tipo_inst or 'Contratação'} nº {numero_compra}".strip()
+                    titulo = f"{tipo_inst} n° {numero_compra}".strip()
                 else:
-                    titulo = _primeiro_valor(
-                        item.get("titulo"),
-                        item.get("title"),
-                        numero_controle,
-                        "Contratação",
-                    )
+                    titulo = _primeiro_valor(numero_controle, "Contratação")
+                if processo:
+                    titulo = f"{titulo} | Processo {processo}"
 
                 resultados.append(
                     {
@@ -678,39 +681,39 @@ def _consultar_pncp_api_consulta(
                         "municipio_nome": cidade_api or municipio_nome,
                         "uf": uf_api or municipio_uf,
                         "orgao_cnpj": cnpj,
-                        "orgao_nome": str(orgao.get("razaosocial") or orgao.get("razaoSocial") or ""),
+                        "orgao_nome": str(item.get("orgaoEntidadeRazaoSocial") or ""),
                         "ano": ano,
                         "numero_sequencial": seq,
                         "title": titulo,
                         "description": objeto_compra or info_compl,
                         "document_type": tipo_inst,
                         "modalidade_licitacao_nome": modalidade_nome,
-                        "tipo_nome": _primeiro_valor(modo_disputa_nome, situacao_compra_nome),
-                        "unidade_nome": str(unidade.get("nomeUnidade") or ""),
-                        "esfera_nome": str(orgao.get("esferaId") or ""),
+                        "tipo_nome": tipo_inst,
+                        "unidade_nome": str(item.get("unidadeOrgaoNomeUnidade") or ""),
+                        "esfera_nome": str(item.get("orgaoEntidadeEsferaId") or ""),
                         "situacao_compra_nome": situacao_compra_nome,
                         "data_publicacao_pncp": data_pub_raw,
                         "data_fim_vigencia": data_enc,
-                        "numeroProcesso": str(item.get("processo") or ""),
+                        "numeroProcesso": processo,
                         "item_url": _primeiro_valor(
                             f"/app/editais/{cnpj}/{ano}/{seq}" if cnpj and ano and seq else "",
-                            item.get("linkSistemaOrigem"),
+                            "",
                             "",
                         ),
-                        "id": uid or numero_controle,
+                        "id": uid or numero_controle or str(item.get("idCompra") or ""),
                     }
                 )
 
-            if len(itens) < CFG_CONSULTA_TAM_PAGINA and pagina != 1:
+            if len(itens) < CFG_DA_TAM_PAGINA and pagina != 1:
                 continue
         if limite_tempo_atingido or limite_req_atingido or abortar_por_erro:
             break
 
     if abortar_por_erro and not resultados:
-        raise RuntimeError("API de Consultas com erro recorrente")
+        raise RuntimeError("API de Dados Abertos com erro recorrente")
 
     if not teve_resposta_consulta and not resultados:
-        raise RuntimeError("API de Consultas indisponível ou não-JSON")
+        raise RuntimeError("API de Dados Abertos indisponível ou sem retorno")
 
     return resultados
 
@@ -756,6 +759,9 @@ def _buscar_orgaos_por_municipio_nome(municipio_nome: str) -> List[Dict]:
         # reduz ruído de entidades não municipais
         esfera = str(o.get("esferaId") or "").upper()
         if esfera and esfera != "M":
+            continue
+        poder = str(o.get("poderId") or "").upper()
+        if (not CFG_INCLUIR_PODER_LEGISLATIVO) and poder == "L":
             continue
 
         rz = _norm(razao)
@@ -812,6 +818,22 @@ def _primeiro_item_compra(cnpj: str, ano: int, seq: int) -> Dict:
     return itens[0] if itens else {}
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _listar_itens_compra(cnpj: str, ano: int, seq: int) -> List[Dict]:
+    url = BASE_API_ITENS.format(cnpj=cnpj, ano=ano, seq=seq)
+    r = requests.get(
+        url,
+        params={"pagina": 1, "tamanhoPagina": 999},
+        headers=HEADERS,
+        timeout=CFG_CONSULTA_TIMEOUT_HTTP,
+    )
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    js = r.json()
+    return js if isinstance(js, list) else _items_from_json(js)
+
+
 def _status_compativel_aprox(status_value: str, situacao_item_nome: str) -> bool:
     if not status_value:
         return True
@@ -824,6 +846,22 @@ def _status_compativel_aprox(status_value: str, situacao_item_nome: str) -> bool
         return s in encerrados
     if status_value in {"recebendo_proposta", "em_julgamento"}:
         return s in andamento
+    return True
+
+
+def _status_compativel_fallback(status_value: str, status_norms: set[str]) -> bool:
+    if not status_value:
+        return True
+
+    has_em_andamento = ("em_andamento" in status_norms) or ("pendente" in status_norms)
+    has_encerrado = bool(status_norms.intersection({"homologado", "fracassado", "deserto", "anulado_revogado_cancelado"}))
+
+    if status_value == "recebendo_proposta":
+        return has_em_andamento
+    if status_value == "em_julgamento":
+        return has_em_andamento and has_encerrado
+    if status_value == "encerrado":
+        return (not has_em_andamento) and has_encerrado
     return True
 
 
@@ -845,7 +883,7 @@ def _consultar_pncp_por_municipio_scan(
     anos = [datetime.now().year - i for i in range(CFG_ANOS_LOOKBACK + 1)]
     t0 = time.monotonic()
     req_count = 0
-    max_seq_scan = min(CFG_MAX_SEQ_SCAN, 80)
+    max_seq_scan = min(CFG_MAX_SEQ_SCAN, 220)
 
     for org in orgaos:
         if (time.monotonic() - t0) >= CFG_CONSULTA_MAX_SEGUNDOS_MUNICIPIO:
@@ -884,35 +922,69 @@ def _consultar_pncp_por_municipio_scan(
                     continue
 
                 misses = 0
-                doc = next(
-                    (
-                        a
-                        for a in arqs
-                        if "edital" in _norm(a.get("tipoDocumentoNome", ""))
-                        or "aviso" in _norm(a.get("tipoDocumentoNome", ""))
-                    ),
-                    None,
-                )
-                if not doc:
+                docs_edital = [
+                    a
+                    for a in arqs
+                    if "edital" in _norm(a.get("tipoDocumentoNome", ""))
+                    or "aviso" in _norm(a.get("tipoDocumentoNome", ""))
+                ]
+                if not docs_edital:
                     continue
 
-                item0 = {}
+                # Evita títulos genéricos como "Capa-Licitacao", priorizando o edital mais informativo.
+                def _score_doc_titulo(d: Dict) -> int:
+                    t = _norm(d.get("titulo", ""))
+                    if not t:
+                        return 0
+                    if t in {"capa_licitacao", "edital", "aviso"}:
+                        return 1
+                    score = 10
+                    if "pe_" in t or "pregao" in t:
+                        score += 3
+                    if "tr_" in t or "termo_referencia" in t:
+                        score -= 2
+                    return score
+
+                docs_edital.sort(key=_score_doc_titulo, reverse=True)
+                doc = docs_edital[0]
+
+                itens_compra: List[Dict] = []
                 try:
                     if req_count >= CFG_CONSULTA_MAX_REQUISICOES_MUNICIPIO:
                         break
                     req_count += 1
-                    item0 = _primeiro_item_compra(cnpj, ano, seq)
+                    itens_compra = _listar_itens_compra(cnpj, ano, seq)
                 except Exception:
-                    item0 = {}
+                    itens_compra = []
 
-                sit_nome = str(item0.get("situacaoCompraItemNome") or "")
-                if not _status_compativel_aprox(status_value, sit_nome):
+                status_norms = {
+                    _norm(i.get("situacaoCompraItemNome", ""))
+                    for i in itens_compra
+                    if i.get("situacaoCompraItemNome")
+                }
+                if not _status_compativel_fallback(status_value, status_norms):
                     continue
 
                 uid = f"{cnpj}-{ano}-{seq}"
                 if uid in vistos:
                     continue
                 vistos.add(uid)
+
+                # No fluxo de fallback, o objeto consolidado não está disponível.
+                # Evita preencher com descrição de um único item para não distorcer o card.
+                status_legiveis = sorted(
+                    {
+                        str(i.get("situacaoCompraItemNome", "")).strip()
+                        for i in itens_compra
+                        if str(i.get("situacaoCompraItemNome", "")).strip()
+                    }
+                )
+                titulo_doc = str(doc.get("titulo") or "").strip()
+                if not titulo_doc or _norm(titulo_doc) in {"capa_licitacao", "edital", "aviso"}:
+                    titulo_doc = f"Edital {ano}/{seq}"
+
+                pub_candidates = [a.get("dataPublicacaoPncp") for a in docs_edital if a.get("dataPublicacaoPncp")]
+                pub_raw = sorted(pub_candidates)[-1] if pub_candidates else ""
 
                 resultados.append(
                     {
@@ -922,11 +994,12 @@ def _consultar_pncp_por_municipio_scan(
                         "orgao_nome": orgao_nome,
                         "ano": str(ano),
                         "numero_sequencial": str(seq),
-                        "title": doc.get("titulo") or f"Edital {ano}/{seq}",
-                        "description": item0.get("descricao") or "",
+                        "title": titulo_doc,
+                        "description": "",
                         "document_type": doc.get("tipoDocumentoNome") or "",
-                        "data_publicacao_pncp": doc.get("dataPublicacaoPncp") or item0.get("dataInclusao") or "",
-                        "situacao_compra_item_nome": sit_nome,
+                        "data_publicacao_pncp": pub_raw,
+                        "tipo_nome": ", ".join(status_legiveis),
+                        "situacao_compra_item_nome": ", ".join(status_legiveis),
                         "item_url": f"/app/editais/{cnpj}/{ano}/{seq}",
                         "id": uid,
                     }
@@ -945,7 +1018,7 @@ def consultar_pncp_por_municipio(
     tam_pagina: int = TAM_PAGINA_FIXO,
     delay_s: float = 0.02,
 ) -> List[Dict]:
-    # 1) Fluxo principal: API de Consultas oficial (/api/consulta/v1)
+    # 1) Fluxo principal: API oficial de Dados Abertos (Contratações 14.133)
     try:
         return _consultar_pncp_api_consulta(
             municipio_id=municipio_id,
@@ -985,18 +1058,34 @@ def montar_registro(item: Dict, municipio_codigo: str, municipio_nome: str, muni
     ano = str(item.get("ano") or "").strip()
     seq = str(item.get("numero_sequencial") or "").strip()
     raw_id = str(item.get("id") or item.get("uuid") or "")
+    titulo = str(item.get("title", "") or item.get("titulo", "") or "").strip()
+    if not titulo:
+        num = str(item.get("numeroCompra") or "").strip()
+        tipo_inst = str(item.get("document_type") or item.get("tipo_nome") or "Edital").strip()
+        if num and ano:
+            titulo = f"{tipo_inst} n° {num}/{ano}"
+        elif num:
+            titulo = f"{tipo_inst} n° {num}"
+        else:
+            titulo = "(Sem título)"
+    tipo_card = _primeiro_valor(
+        item.get("document_type"),
+        item.get("tipo_nome"),
+        item.get("tipoInstrumentoConvocatorioNome"),
+        item.get("situacao_compra_item_nome"),
+    )
 
     return {
         "municipio_codigo": municipio_codigo,
         "Cidade": item.get("municipio_nome", "") or municipio_nome,
         "UF": item.get("uf", "") or municipio_uf,
-        "Título": item.get("title", "") or item.get("titulo", ""),
+        "Título": titulo,
         "Objeto": item.get("description", "") or item.get("objeto", ""),
         "Link para o edital": _build_pncp_link(
             {"orgao_cnpj": orgao_cnpj, "ano": ano, "numero_sequencial": seq, "item_url": item.get("item_url", "")}
         ),
         "Modalidade": item.get("modalidade_licitacao_nome", ""),
-        "Tipo": item.get("tipo_nome", ""),
+        "Tipo": str(tipo_card or "").strip(),
         "Tipo (documento)": item.get("document_type", ""),
         "Orgão": item.get("orgao_nome", "") or item.get("orgao", ""),
         "Unidade": item.get("unidade_nome", ""),
@@ -1070,6 +1159,9 @@ def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
             )
         except Exception:
             itens = []
+        if not codigo_ibge and not itens:
+            # Evita falso "zerado" por falta de código IBGE no novo endpoint oficial.
+            continue
         for it in itens:
             registros.append(montar_registro(it, codigo, nome, uf))
 
@@ -1328,22 +1420,20 @@ def main():
           border-color: #122e67 !important;
         }
         .ac-card {
-          background: #f8fbff;
-          border: 1.25px solid #cad9f3;
-          border-radius: 18px;
-          padding: 1.05rem 1.2rem;
+          background: #f3f6fb;
+          border: 1px solid #b9d0ee;
+          border-radius: 16px;
+          padding: 1.25rem 1.15rem;
           margin-bottom: 1rem;
-          box-shadow: 0 8px 20px rgba(20, 45, 110, 0.06);
-          transition: box-shadow 0.15s ease, transform 0.15s ease;
+          box-shadow: none;
         }
-        .ac-card:hover {
-          box-shadow: 0 10px 24px rgba(20, 45, 110, 0.10);
-          transform: translateY(-1px);
-        }
-        .ac-card h3 { margin-top: 0; margin-bottom: 0.25rem; font-size: 1.08rem; color: #0b1b36; }
-        .ac-muted { color: #415477; font-size: 0.92rem; }
+        .ac-card h3 { margin-top: 0; margin-bottom: 0.7rem; font-size: 1.85rem; font-weight: 700; color: #0b1b36; letter-spacing: -0.01em; }
+        .ac-muted { color: #2b4677; font-size: 0.95rem; margin-bottom: 0.65rem; }
+        .ac-obj { margin-top: 0.2rem; margin-bottom: 0.8rem; font-size: 1.04rem; color: #0b1b36; }
+        .ac-meta { margin-top: 0.2rem; font-size: 1rem; color: #0b1b36; }
+        .ac-actions { display:flex; justify-content:flex-end; margin-top: 0.9rem; }
         .ac-badge {
-          background: #eaf1ff; border: 1px solid #bcd0f7; color: #0b3b8a;
+          background: #eaf1ff; border: 1px solid #bcd0f7; color: #2d62b3;
           padding: 0.18rem 0.5rem; border-radius: 999px; font-size: 0.82rem;
         }
         .ac-flag {
@@ -1355,8 +1445,9 @@ def main():
           padding: 0.18rem 0.5rem; border-radius: 999px; font-size: 0.82rem; margin-left: 0.5rem;
         }
         .ac-link {
-          text-decoration:none; padding:0.46rem 0.85rem; border-radius:10px;
-          border:1px solid #96b3e9; color:#0b3b8a;
+          text-decoration:none; padding:0.54rem 1rem; border-radius:12px;
+          border:1px solid #8db0ea; color:#2d62b3; background:#f2f7ff;
+          font-weight: 600;
         }
         </style>
     ''', unsafe_allow_html=True)
@@ -1375,6 +1466,7 @@ def main():
     # Enriquecimento retrocompatível para pesquisas salvas antigas (sem codigo_ibge)
     if st.session_state.selected_municipios:
         mapa_ibge = {}
+        mapa_ibge_uf_nome = {}
         if "codigo_pncp" in pncp_df.columns and "codigo_ibge" in pncp_df.columns:
             try:
                 mapa_ibge = (
@@ -1385,9 +1477,22 @@ def main():
                 )
             except Exception:
                 mapa_ibge = {}
+        if ibge_df is not None and {"uf", "municipio", "codigo_ibge"}.issubset(set(ibge_df.columns)):
+            try:
+                mapa_ibge_uf_nome = {
+                    (str(r["uf"]).strip().upper(), _norm(str(r["municipio"]))): str(r["codigo_ibge"] or "").strip()
+                    for _, r in ibge_df[["uf", "municipio", "codigo_ibge"]].iterrows()
+                }
+            except Exception:
+                mapa_ibge_uf_nome = {}
         for m in st.session_state.selected_municipios:
             if not str(m.get("codigo_ibge") or "").strip():
-                m["codigo_ibge"] = str(mapa_ibge.get(str(m.get("codigo_pncp") or "").strip(), "") or "").strip()
+                by_pncp = str(mapa_ibge.get(str(m.get("codigo_pncp") or "").strip(), "") or "").strip()
+                if by_pncp:
+                    m["codigo_ibge"] = by_pncp
+                else:
+                    chave = (str(m.get("uf") or "").strip().upper(), _norm(str(m.get("nome") or "")))
+                    m["codigo_ibge"] = str(mapa_ibge_uf_nome.get(chave, "") or "").strip()
 
     status_value = STATUS_MAP.get(st.session_state.sidebar_inputs["status_label"], "")
     palavra_chave = (st.session_state.sidebar_inputs["palavra_chave"] or "").strip()
@@ -1467,6 +1572,48 @@ def main():
         tr_flag = bool(st.session_state.tr_marks.get(uid, False))
         na_flag = bool(st.session_state.na_marks.get(uid, False))
 
+        link = row.get("Link para o edital", "")
+        titulo = row.get("Título") or "(Sem título)"
+        cidade = row.get("Cidade", "")
+        uf = row.get("UF", "")
+        pub = row.get("Publicação", "")
+        fim = row.get("Fim do envio de proposta", "")
+        objeto = row.get("Objeto", "")
+        modalidade = row.get("Modalidade", "")
+        tipo = row.get("Tipo", "") or row.get("Tipo (documento)", "") or "Edital"
+        orgao = row.get("Orgão", "")
+        proc = (row.get("numero_processo") or "").strip()
+        titulo_card = str(titulo).strip()
+        if proc and ("processo" not in titulo_card.lower()):
+            titulo_card = f"{titulo_card} | Processo {proc}"
+        if not titulo_card:
+            titulo_card = "(Sem título)"
+
+        html = f'''
+        <div class="ac-card">
+            <h3>{titulo_card}</h3>
+            <div class="ac-muted">
+                <span class="ac-badge">{cidade} / {uf}</span>
+                &nbsp;•&nbsp;
+                <strong>Publicação:</strong> {pub}
+                &nbsp;|&nbsp;
+                <strong>Fim do envio:</strong> {fim}
+            </div>
+            <div class="ac-obj"><strong>Objeto:</strong> {objeto}</div>
+            <div class="ac-meta">
+                <strong>Modalidade:</strong> {modalidade}
+                &nbsp;&nbsp;
+                <strong>Tipo:</strong> {tipo}
+                &nbsp;&nbsp;
+                <strong>Órgão:</strong> {orgao}
+            </div>
+            <div class="ac-actions">
+                {f'<a class="ac-link" href="{link}" target="_blank">Abrir edital</a>' if isinstance(link, str) and link else ''}
+            </div>
+        </div>
+        '''
+        st.markdown(html, unsafe_allow_html=True)
+
         _, col_cb_tr, col_cb_na = st.columns([6, 1.3, 1.3])
         with col_cb_tr:
             new_tr = st.checkbox("TR Elaborado", value=tr_flag, key=f"tr_{uid}")
@@ -1484,46 +1631,6 @@ def main():
             updated = True
         if updated:
             st.rerun()
-
-        link = row.get("Link para o edital", "")
-        titulo = row.get("Título") or "(Sem título)"
-        cidade = row.get("Cidade", "")
-        uf = row.get("UF", "")
-        pub = row.get("Publicação", "")
-        fim = row.get("Fim do envio de proposta", "")
-        objeto = row.get("Objeto", "")
-        modalidade = row.get("Modalidade", "")
-        tipo = row.get("Tipo", "")
-        orgao = row.get("Orgão", "")
-        proc = (row.get("numero_processo") or "").strip()
-
-        tr_badge = '<span class="ac-flag">TR Elaborado</span>' if new_tr else ''
-        na_badge = '<span class="ac-flag-na">Não Atende</span>' if new_na else ''
-        processo_html = f'<div class="ac-muted">Processo: {proc}</div>' if proc else '<div></div>'
-
-        html = f'''
-        <div class="ac-card">
-            <h3>{titulo} {tr_badge} {na_badge}</h3>
-            <div class="ac-muted">
-                <span class="ac-badge">{cidade} / {uf}</span>
-                &nbsp;•&nbsp;
-                <strong>Publicação:</strong> {pub}
-                &nbsp;|&nbsp;
-                <strong>Fim do envio:</strong> {fim}
-            </div>
-            <div style="margin-top:0.55rem;"><strong>Objeto:</strong> {objeto}</div>
-            <div style="display:flex; gap:1rem; margin-top:0.55rem; flex-wrap:wrap;">
-                <div><strong>Modalidade:</strong> {modalidade}</div>
-                <div><strong>Tipo:</strong> {tipo}</div>
-                <div><strong>Órgão:</strong> {orgao}</div>
-            </div>
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.7rem;">
-                {processo_html}
-                {f'<a class="ac-link" href="{link}" target="_blank">Abrir edital</a>' if isinstance(link, str) and link else ''}
-            </div>
-        </div>
-        '''
-        st.markdown(html, unsafe_allow_html=True)
 
     col_a2, col_b2, col_c2 = st.columns([1, 2, 1])
     with col_a2:
@@ -1556,5 +1663,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

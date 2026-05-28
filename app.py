@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
-import io
-import re
-import json
 import base64
 import hashlib
+import html
+import io
+import json
+import os
+import re
+import time
 import unicodedata
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -17,10 +19,10 @@ import streamlit as st
 
 
 # ==========================
-# Configuração de página
+# Configuracao de pagina
 # ==========================
 st.set_page_config(
-    page_title="Acerte Licitações - O seu Buscador de Editais",
+    page_title="Acerte Licitacoes - Backup API PNCP",
     page_icon="📑",
     layout="wide",
 )
@@ -32,61 +34,17 @@ st.set_page_config(
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-CSV_PNCP_PATHS = [
-    os.path.join(DATA_DIR, "ListaMunicipiosPNCP.csv"),
-    "ListaMunicipiosPNCP.csv",
-]
-CSV_IBGE_PATHS = [
-    os.path.join(DATA_DIR, "IBGE_Municipios.csv"),
-    "IBGE_Municipios.csv",
-]
-
-SAVED_SEARCHES_PATHS = [
-    os.path.join(DATA_DIR, "saved_searches.json"),
-    os.path.join(BASE_DIR, "saved_searches.json"),
-]
-TR_MARKS_PATHS = [
-    os.path.join(DATA_DIR, "tr_marks.json"),
-    os.path.join(BASE_DIR, "tr_marks.json"),
-]
-NA_MARKS_PATHS = [
-    os.path.join(DATA_DIR, "na_marks.json"),
-    os.path.join(BASE_DIR, "na_marks.json"),
-]
-
 ORIGIN = "https://pncp.gov.br"
-API_DADOS_ABERTOS = "https://dadosabertos.compras.gov.br/modulo-contratacoes/1_consultarContratacoes_PNCP_14133"
-API_IBGE_LOCALIDADES = "https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
 API_CONSULTA_BASE = ORIGIN + "/api/consulta/v1"
-API_CONSULTA_PUBLICACAO = API_CONSULTA_BASE + "/contratacoes/publicacao"
 API_CONSULTA_PROPOSTA = API_CONSULTA_BASE + "/contratacoes/proposta"
-API_INTEGRACAO_ORGAOS = ORIGIN + "/pncp-api/v1/orgaos/"
-API_INTEGRACAO_ARQUIVOS = ORIGIN + "/pncp-api/v1/orgaos/{cnpj}/compras/{ano}/{seq}/arquivos"
-API_INTEGRACAO_ITENS = ORIGIN + "/pncp-api/v1/orgaos/{cnpj}/compras/{ano}/{seq}/itens"
+API_CONSULTA_PUBLICACAO = API_CONSULTA_BASE + "/contratacoes/publicacao"
+API_IBGE_MUNICIPIOS_UF = "https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
 
 HEADERS = {
-    "User-Agent": "AcerteLicitacoesBackup/1.0 (+streamlit)",
+    "User-Agent": "AcerteLicitacoesBackupAPI/2.0 (+streamlit)",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "pt-BR,pt;q=0.9",
 }
-
-# Manual API Compras (10.1 - Indicadores de Modalidade da Compra)
-# 01,02,03,04,05,06,07,12,20,22,33,44,57
-MODALIDADES_PADRAO = [1, 2, 3, 4, 5, 6, 7, 12, 20, 22, 33, 44, 57]
-# Manual API Consultas PNCP v1.0 (5.2 Modalidade de Contratação): 1..13
-MODALIDADES_CONSULTA_PADRAO = list(range(1, 14))
-
-# Layout/Comportamento
-TAM_PAGINA_CARDS_PADRAO = 10
-TAM_PAGINA_API_PADRAO = 200
-MAX_PAGINAS_MODALIDADE_PADRAO = 4
-LOOKBACK_DIAS_PADRAO = 365  # limite do endpoint
-MAX_MUNICIPIOS = 25
-
-# GitHub fallback (repo público de teste)
-DEFAULT_GITHUB_REPO = "LucianoMatelli/acerte.debug"
-DEFAULT_GITHUB_BRANCH = "main"
-DEFAULT_GITHUB_BASEDIR = "data"
 
 STATUS_LABELS = [
     "A Receber/Recebendo Proposta",
@@ -100,11 +58,28 @@ STATUS_MAP = {
     "Encerradas": "encerrado",
     "Todos": "",
 }
+
+UFS = [
+    "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS",
+    "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC",
+    "SP", "SE", "TO",
+]
 UF_PLACEHOLDER = "— Selecione a UF —"
+
+MODALIDADES_CONSULTA = list(range(1, 14))
+MAX_MUNICIPIOS = 25
+
+SAVED_SEARCHES_LOCAL = os.path.join(DATA_DIR, "saved_searches.json")
+TR_MARKS_LOCAL = os.path.join(DATA_DIR, "tr_marks.json")
+NA_MARKS_LOCAL = os.path.join(DATA_DIR, "na_marks.json")
+
+DEFAULT_GITHUB_REPO = "LucianoMatelli/acerte.debug"
+DEFAULT_GITHUB_BRANCH = "main"
+DEFAULT_GITHUB_BASEDIR = "data"
 
 
 # ==========================
-# Utilitários
+# Utilitarios
 # ==========================
 def _norm(s: str) -> str:
     s = str(s or "").strip().lower()
@@ -118,55 +93,38 @@ def _safe_text(v) -> str:
     return str(v or "").strip()
 
 
-def _secret_int(name: str, default: int) -> int:
+def _secret(name: str, default: str = "") -> str:
     try:
-        v = int(st.secrets.get(name, default))
-        return v if v > 0 else default
+        value = st.secrets.get(name, default)
     except Exception:
-        return default
+        value = os.getenv(name, default)
+    return _safe_text(value)
 
 
-def _secret_int_list(name: str, default: List[int]) -> List[int]:
-    raw = str(st.secrets.get(name, "") or "").strip()
-    if not raw:
-        return list(default)
-    out: List[int] = []
-    for p in raw.split(","):
-        try:
-            v = int(p.strip())
-            if v > 0:
-                out.append(v)
-        except Exception:
-            continue
-    uniq = sorted(set(out))
-    return uniq if uniq else list(default)
+def _secret_int(name: str, default: int, min_value: int = 1, max_value: Optional[int] = None) -> int:
+    try:
+        value = int(_secret(name, str(default)))
+    except Exception:
+        value = default
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
 
 
-CFG_TAM_PAGINA_API = min(500, _secret_int("BACKUP_TAM_PAGINA_API", TAM_PAGINA_API_PADRAO))
-CFG_MAX_PAGINAS_MODALIDADE = _secret_int("BACKUP_MAX_PAGINAS_MODALIDADE", MAX_PAGINAS_MODALIDADE_PADRAO)
-CFG_LOOKBACK_DIAS = min(365, _secret_int("BACKUP_LOOKBACK_DIAS", LOOKBACK_DIAS_PADRAO))
-CFG_TIMEOUT = _secret_int("BACKUP_TIMEOUT_HTTP", 20)
-CFG_MODALIDADES = _secret_int_list("BACKUP_MODALIDADES", MODALIDADES_PADRAO)
-CFG_APENAS_EDITAL = str(st.secrets.get("BACKUP_APENAS_EDITAL", "false")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-CFG_CONSULTA_TAM_PAGINA = min(500, _secret_int("BACKUP_CONSULTA_TAM_PAGINA", 100))
-CFG_CONSULTA_MAX_PAGINAS_MODALIDADE = _secret_int("BACKUP_CONSULTA_MAX_PAGINAS_MODALIDADE", 8)
-CFG_CONSULTA_MODALIDADES = _secret_int_list("BACKUP_CONSULTA_MODALIDADES", MODALIDADES_CONSULTA_PADRAO)
-CFG_SCAN_ANOS_LOOKBACK = _secret_int("BACKUP_SCAN_ANOS_LOOKBACK", 1)
-CFG_SCAN_MAX_SEQ = _secret_int("BACKUP_SCAN_MAX_SEQ", 260)
-CFG_SCAN_MISS_STREAK_STOP = _secret_int("BACKUP_SCAN_MISS_STREAK_STOP", 45)
-CFG_SCAN_MAX_ORGAOS = _secret_int("BACKUP_SCAN_MAX_ORGAOS", 12)
+PAGE_SIZE_API = _secret_int("BACKUP_API_TAMANHO_PAGINA", 50, 10, 50)
+MAX_PAGES_API = _secret_int("BACKUP_API_MAX_PAGINAS", 30, 1, 200)
+TIMEOUT_API = _secret_int("BACKUP_API_TIMEOUT", 30, 5, 120)
+PROPOSTA_DIAS_A_FRENTE = _secret_int("BACKUP_PROPOSTA_DIAS_A_FRENTE", 45, 1, 365)
+PUBLICACAO_DIAS_LOOKBACK = _secret_int("BACKUP_PUBLICACAO_DIAS_LOOKBACK", 365, 1, 365)
+API_RETRIES = _secret_int("BACKUP_API_RETRIES", 3, 1, 5)
 
 
-def _fmt_dt_iso_to_br(dt: str) -> str:
-    if not dt:
+def _fmt_dt_iso_to_br(value: str) -> str:
+    if not value:
         return ""
     try:
-        ts = pd.to_datetime(dt, errors="coerce", utc=False)
+        ts = pd.to_datetime(value, errors="coerce", utc=False)
         if pd.isna(ts):
             return ""
         return ts.strftime("%d/%m/%Y %H:%M")
@@ -174,23 +132,30 @@ def _fmt_dt_iso_to_br(dt: str) -> str:
         return ""
 
 
-def _public_edital_link(cnpj: str, ano: str, seq: str) -> str:
-    if len(cnpj) == 14 and str(ano).isdigit() and str(seq):
+def _parse_numero_controle(numero_controle: str) -> Tuple[str, str, str]:
+    match = re.search(r"^(\d{14})-1-(\d+)/(\d{4})$", _safe_text(numero_controle))
+    if not match:
+        return "", "", ""
+    cnpj = match.group(1)
+    seq = match.group(2)
+    ano = match.group(3)
+    return cnpj, ano, seq
+
+
+def _build_pncp_link(cnpj: str, ano: str, seq: str) -> str:
+    cnpj = _safe_text(cnpj)
+    ano = _safe_text(ano)
+    seq = _safe_text(seq)
+    if len(cnpj) == 14 and ano.isdigit() and seq:
         return f"{ORIGIN}/app/editais/{cnpj}/{ano}/{seq}"
     return ""
 
 
-def _parse_numero_controle(numero_controle: str) -> Tuple[str, str, str]:
-    # Manual API Consultas PNCP v1.0:
-    # contratação => 99999999999999-1-999999/9999
-    n = _safe_text(numero_controle)
-    m = re.search(r"^(\d{14})-1-(\d+)/(\d{4})$", n)
-    if not m:
-        return "", "", ""
-    cnpj = m.group(1)
-    seq = m.group(2)
-    ano = m.group(3)
-    return cnpj, ano, seq
+def _first_dict(*values) -> Dict:
+    for value in values:
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def _uid_from_row(row: Dict) -> str:
@@ -201,119 +166,82 @@ def _uid_from_row(row: Dict) -> str:
         return f"{cnpj}-{ano}-{seq}"
     base = "|".join(
         [
-            _safe_text(row.get("Título")),
+            _safe_text(row.get("Titulo")),
             _safe_text(row.get("Cidade")),
             _safe_text(row.get("UF")),
             _safe_text(row.get("_pub_raw")),
-            _safe_text(row.get("Orgão")),
+            _safe_text(row.get("Orgao")),
         ]
     )
     return hashlib.md5(base.encode("utf-8")).hexdigest()
 
 
-def _load_json_from_candidates(paths: List[str]) -> Optional[dict]:
-    for p in paths:
-        try:
-            if os.path.exists(p):
-                with open(p, "r", encoding="utf-8") as f:
-                    js = json.load(f)
-                if isinstance(js, dict):
-                    return js
-        except Exception:
-            continue
-    return None
-
-
-def _save_json_to_candidates(paths: List[str], payload: dict) -> None:
-    target = ""
-    for p in paths:
-        try:
-            if os.path.exists(p):
-                target = p
-                break
-        except Exception:
-            continue
-    if not target:
-        target = paths[0]
-    parent = os.path.dirname(target)
-    if parent and not os.path.exists(parent):
-        os.makedirs(parent, exist_ok=True)
-    with open(target, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+def _escape(value) -> str:
+    return html.escape(_safe_text(value), quote=True)
 
 
 # ==========================
-# Persistência GitHub + local
+# GitHub/local para salvos
 # ==========================
-def _gh_repo() -> str:
-    return (
-        _safe_text(st.secrets.get("GITHUB_REPO_TEST"))
-        or _safe_text(st.secrets.get("GITHUB_REPO"))
-        or _safe_text(os.getenv("GITHUB_REPOSITORY"))
-        or DEFAULT_GITHUB_REPO
-    )
+def _github_repo() -> str:
+    return _secret("GITHUB_REPO_TEST") or _secret("GITHUB_REPO") or DEFAULT_GITHUB_REPO
 
 
-def _gh_branch() -> str:
-    return (
-        _safe_text(st.secrets.get("GITHUB_BRANCH_TEST"))
-        or _safe_text(st.secrets.get("GITHUB_BRANCH"))
-        or DEFAULT_GITHUB_BRANCH
-    )
+def _github_branch() -> str:
+    return _secret("GITHUB_BRANCH_TEST") or _secret("GITHUB_BRANCH") or DEFAULT_GITHUB_BRANCH
 
 
-def _gh_basedir() -> str:
-    base_test = st.secrets.get("GITHUB_BASEDIR_TEST")
-    if base_test is not None:
-        return _safe_text(base_test)
-    return _safe_text(st.secrets.get("GITHUB_BASEDIR")) or DEFAULT_GITHUB_BASEDIR
+def _github_basedir() -> str:
+    return _secret("GITHUB_BASEDIR_TEST") or _secret("GITHUB_BASEDIR") or DEFAULT_GITHUB_BASEDIR
 
 
-def _gh_headers() -> Dict[str, str]:
-    h = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "AcerteLicitacoesBackup/1.0",
-    }
-    token = _safe_text(st.secrets.get("GITHUB_TOKEN"))
-    if token:
-        h["Authorization"] = f"token {token}"
-    return h
+def _github_token() -> str:
+    return _secret("GITHUB_TOKEN")
 
 
-def _gh_path(filename: str) -> Tuple[str, str, str]:
-    repo = _gh_repo()
-    branch = _gh_branch()
-    basedir = _gh_basedir()
-    path = f"{basedir.rstrip('/')}/{filename}" if basedir else filename
+def _github_path(filename: str) -> Tuple[str, str, str]:
+    repo = _github_repo()
+    branch = _github_branch()
+    basedir = _github_basedir().strip("/")
+    path = f"{basedir}/{filename}" if basedir else filename
     return repo, branch, path
 
 
+def _gh_headers() -> Dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "AcerteLicitacoesBackupAPI",
+    }
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"token {token}"
+    return headers
+
+
 def _gh_get_json(filename: str) -> Tuple[Optional[dict], Optional[str]]:
-    repo, branch, path = _gh_path(filename)
+    repo, branch, path = _github_path(filename)
 
-    # 1) GitHub Contents API
-    try:
-        url = f"https://api.github.com/repos/{repo}/contents/{path}"
-        r = requests.get(url, params={"ref": branch}, headers=_gh_headers(), timeout=20)
-        if 200 <= r.status_code < 300:
-            js = r.json()
-            content_b64 = _safe_text(js.get("content"))
-            sha = _safe_text(js.get("sha")) or None
-            raw = base64.b64decode(content_b64).decode("utf-8")
-            parsed = json.loads(raw)
-            return (parsed if isinstance(parsed, dict) else None), sha
-    except Exception:
-        pass
+    if _github_token():
+        try:
+            url = f"https://api.github.com/repos/{repo}/contents/{path}"
+            r = requests.get(url, params={"ref": branch}, headers=_gh_headers(), timeout=20)
+            if r.status_code == 404:
+                return None, None
+            if 200 <= r.status_code < 300:
+                js = r.json()
+                raw = base64.b64decode(js.get("content", "")).decode("utf-8")
+                return json.loads(raw), js.get("sha")
+        except Exception:
+            pass
 
-    # 2) RAW público
     try:
         raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
-        rr = requests.get(raw_url, headers={"User-Agent": "AcerteLicitacoesBackup/1.0"}, timeout=20)
-        if rr.status_code == 200:
-            parsed = json.loads(rr.text)
-            if isinstance(parsed, dict):
-                return parsed, None
+        r = requests.get(raw_url, headers=HEADERS, timeout=20)
+        if r.status_code == 200:
+            js = r.json()
+            if isinstance(js, dict):
+                return js, None
     except Exception:
         pass
 
@@ -321,917 +249,388 @@ def _gh_get_json(filename: str) -> Tuple[Optional[dict], Optional[str]]:
 
 
 def _gh_put_json(filename: str, payload: dict, sha: Optional[str]) -> None:
-    token = _safe_text(st.secrets.get("GITHUB_TOKEN"))
+    token = _github_token()
     if not token:
-        raise RuntimeError("GITHUB_TOKEN ausente para escrita no GitHub")
+        raise RuntimeError("GITHUB_TOKEN ausente")
 
-    repo, branch, path = _gh_path(filename)
+    repo, branch, path = _github_path(filename)
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     content_b64 = base64.b64encode(
         json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     ).decode("utf-8")
-
-    data = {
+    body = {
         "message": f"chore: atualizar {path} via app backup",
         "content": content_b64,
         "branch": branch,
         "committer": {
-            "name": _safe_text(st.secrets.get("GITHUB_COMMITTER_NAME")) or "PNCP Bot",
-            "email": _safe_text(st.secrets.get("GITHUB_COMMITTER_EMAIL")) or "bot@acertelicitacoes.local",
+            "name": _secret("GITHUB_COMMITTER_NAME", "PNCP Bot"),
+            "email": _secret("GITHUB_COMMITTER_EMAIL", "bot@acertelicitacoes.local"),
         },
     }
     if sha:
-        data["sha"] = sha
+        body["sha"] = sha
 
-    r = requests.put(url, headers=_gh_headers(), json=data, timeout=20)
-    if r.status_code >= 400:
-        raise RuntimeError(f"GitHub PUT {r.status_code}: {r.text[:180]}")
-
-
-def _load_saved_searches() -> Dict[str, Dict]:
-    js, _ = _gh_get_json("saved_searches.json")
-    if isinstance(js, dict):
-        return js
-    local = _load_json_from_candidates(SAVED_SEARCHES_PATHS)
-    return local if isinstance(local, dict) else {}
+    r = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
+    r.raise_for_status()
 
 
-def _persist_saved_searches(payload: Dict[str, Dict]) -> None:
+def _load_json(filename: str, local_path: str) -> Dict:
+    remote, _ = _gh_get_json(filename)
+    if isinstance(remote, dict):
+        return remote
     try:
-        _, sha = _gh_get_json("saved_searches.json")
-        _gh_put_json("saved_searches.json", payload, sha)
-        return
+        if os.path.exists(local_path):
+            with open(local_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except Exception:
         pass
-    _save_json_to_candidates(SAVED_SEARCHES_PATHS, payload)
-
-
-def _load_marks(remote_name: str, local_paths: List[str]) -> Dict[str, bool]:
-    js, _ = _gh_get_json(remote_name)
-    if isinstance(js, dict):
-        return {str(k): bool(v) for k, v in js.items()}
-    local = _load_json_from_candidates(local_paths)
-    if isinstance(local, dict):
-        return {str(k): bool(v) for k, v in local.items()}
     return {}
 
 
-def _persist_marks(remote_name: str, local_paths: List[str], payload: Dict[str, bool]) -> None:
+def _persist_json(filename: str, local_path: str, payload: Dict) -> None:
     try:
-        _, sha = _gh_get_json(remote_name)
-        _gh_put_json(remote_name, payload, sha)
+        _, sha = _gh_get_json(filename)
+        _gh_put_json(filename, payload, sha)
         return
-    except Exception:
-        pass
-    _save_json_to_candidates(local_paths, payload)
+    except Exception as exc:
+        st.warning(f"Nao consegui salvar no GitHub; usando arquivo local. Detalhe: {exc}")
+
+    try:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        st.error(f"Falha ao salvar localmente: {exc}")
+
+
+def _load_saved_searches() -> Dict[str, Dict]:
+    return _load_json("saved_searches.json", SAVED_SEARCHES_LOCAL)
+
+
+def _persist_saved_searches(payload: Dict[str, Dict]) -> None:
+    _persist_json("saved_searches.json", SAVED_SEARCHES_LOCAL, payload)
+
+
+def _load_marks(filename: str, local_path: str) -> Dict[str, bool]:
+    data = _load_json(filename, local_path)
+    return {str(k): bool(v) for k, v in data.items()}
+
+
+def _persist_marks(filename: str, local_path: str, payload: Dict[str, bool]) -> None:
+    _persist_json(filename, local_path, payload)
 
 
 # ==========================
-# Catálogos locais
+# IBGE online
 # ==========================
-@st.cache_data(show_spinner=False)
-def load_municipios_pncp() -> pd.DataFrame:
-    encodings = ["utf-8", "utf-8-sig", "latin1", "cp1252"]
-    seps = [",", ";", "\t", "|"]
-    last_err = None
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_municipios_ibge(uf: str) -> pd.DataFrame:
+    uf = _safe_text(uf).upper()
+    if uf not in UFS:
+        return pd.DataFrame(columns=["nome", "uf", "codigo_ibge", "label", "nome_norm"])
 
-    def _guess_cols(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-        cols_norm = {_norm(c): c for c in df.columns}
-        col_nome = cols_norm.get("municipio") or cols_norm.get("nome") or ("Municipio" if "Municipio" in df.columns else None)
-        col_codigo = cols_norm.get("id") or cols_norm.get("codigo") or ("id" if "id" in df.columns else None)
-        col_uf = cols_norm.get("uf") or cols_norm.get("estado")
-        col_ibge = (
-            cols_norm.get("codigo_ibge")
-            or cols_norm.get("cod_ibge")
-            or cols_norm.get("ibge")
-            or cols_norm.get("municipio_ibge")
-            or cols_norm.get("codigo_municipio_ibge")
-        )
-        return col_nome, col_codigo, col_uf, col_ibge
+    url = API_IBGE_MUNICIPIOS_UF.format(uf=uf)
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    rows = r.json()
 
-    for path in CSV_PNCP_PATHS:
-        if not os.path.exists(path):
-            continue
-        for enc in encodings:
-            for sep in seps:
-                try:
-                    df = pd.read_csv(path, dtype=str, sep=sep, encoding=enc, engine="python", on_bad_lines="skip")
-                    if df is None or df.empty or df.shape[1] == 0:
-                        continue
-                    col_nome, col_codigo, col_uf, col_ibge = _guess_cols(df)
-                    if not col_nome or not col_codigo:
-                        continue
-                    out = pd.DataFrame({
-                        "nome": df[col_nome].astype(str).str.strip(),
-                        "codigo_pncp": df[col_codigo].astype(str).str.strip(),
-                    })
-                    out["uf"] = df[col_uf].astype(str).str.strip().str.upper() if col_uf else ""
-                    out["codigo_ibge"] = df[col_ibge].astype(str).str.strip() if col_ibge else ""
-                    out["nome_norm"] = out["nome"].map(_norm)
-                    out = out[out["codigo_pncp"] != ""].drop_duplicates(subset=["codigo_pncp"]).reset_index(drop=True)
-                    return out
-                except Exception as e:
-                    last_err = e
-                    continue
+    out: List[Dict[str, str]] = []
+    for item in rows if isinstance(rows, list) else []:
+        nome = _safe_text(item.get("nome"))
+        codigo = _safe_text(item.get("id"))
+        if nome and codigo:
+            out.append(
+                {
+                    "nome": nome,
+                    "uf": uf,
+                    "codigo_ibge": codigo,
+                    "label": f"{nome} / {uf}",
+                    "nome_norm": _norm(nome),
+                }
+            )
 
-    if last_err:
-        raise last_err
-    raise FileNotFoundError("ListaMunicipiosPNCP.csv não encontrada em ./data nem na raiz.")
+    df = pd.DataFrame(out)
+    if df.empty:
+        return pd.DataFrame(columns=["nome", "uf", "codigo_ibge", "label", "nome_norm"])
+    df.sort_values("nome", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
 
-@st.cache_data(show_spinner=False)
-def load_ibge_catalog_local() -> Optional[pd.DataFrame]:
-    encodings = ["utf-8", "utf-8-sig", "latin1", "cp1252"]
-    seps = [",", ";", "\t", "|"]
-    for path in CSV_IBGE_PATHS:
-        if not os.path.exists(path):
-            continue
-        for enc in encodings:
-            for sep in seps:
-                try:
-                    df = pd.read_csv(path, dtype=str, sep=sep, encoding=enc, engine="python", on_bad_lines="skip")
-                    if df is None or df.empty or df.shape[1] < 2:
-                        continue
-                    cols = {c.lower().strip(): c for c in df.columns}
-                    col_uf = next((cols[k] for k in cols if k in ["uf", "sigla_uf", "estado"]), None)
-                    col_mun = next((cols[k] for k in cols if k in ["municipio", "município", "nome"]), None)
-                    col_ibge = next(
-                        (cols[k] for k in cols if k in ["codigo_ibge", "cod_ibge", "ibge", "codigo", "id_municipio", "municipio_id"]),
-                        None,
-                    )
-                    if not col_uf or not col_mun:
-                        continue
-                    out = pd.DataFrame({
-                        "uf": df[col_uf].astype(str).str.strip().str.upper(),
-                        "municipio": df[col_mun].astype(str).str.strip(),
-                    })
-                    out["codigo_ibge"] = df[col_ibge].astype(str).str.strip() if col_ibge else ""
-                    out["municipio_norm"] = out["municipio"].map(_norm)
-                    out = out.drop_duplicates(subset=["uf", "municipio_norm"]).reset_index(drop=True)
-                    return out
-                except Exception:
-                    continue
-    return None
-
-
-@st.cache_data(ttl=604800, show_spinner=False)
-def ibge_municipios_uf_online(uf: str) -> Dict[str, str]:
-    uf_up = _safe_text(uf).upper()
-    if len(uf_up) != 2:
-        return {}
-    try:
-        url = API_IBGE_LOCALIDADES.format(uf=uf_up)
-        r = requests.get(url, headers={"User-Agent": "AcerteLicitacoesBackup/1.0"}, timeout=20)
-        if r.status_code >= 400:
-            return {}
-        js = r.json()
-    except Exception:
-        return {}
-    out: Dict[str, str] = {}
-    if not isinstance(js, list):
-        return out
-    for it in js:
-        nome = _safe_text(it.get("nome"))
-        cod = _safe_text(it.get("id"))
-        if nome and cod.isdigit():
-            out[_norm(nome)] = cod
-    return out
-
-
-def resolver_codigo_ibge(
-    nome_municipio: str,
-    uf: str,
-    pncp_df: pd.DataFrame,
-    ibge_local_df: Optional[pd.DataFrame],
-    codigo_ibge_existente: str = "",
-) -> str:
-    if _safe_text(codigo_ibge_existente).isdigit():
-        return _safe_text(codigo_ibge_existente)
-
-    nome_norm = _norm(nome_municipio)
-    uf_up = _safe_text(uf).upper()
-    if not nome_norm or len(uf_up) != 2:
-        return ""
-
-    # 1) tenta coluna codigo_ibge da lista PNCP
-    try:
-        if {"nome_norm", "uf", "codigo_ibge"}.issubset(set(pncp_df.columns)):
-            hit = pncp_df[(pncp_df["nome_norm"] == nome_norm) & (pncp_df["uf"].str.upper() == uf_up)]
-            if not hit.empty:
-                cod = _safe_text(hit.iloc[0].get("codigo_ibge"))
-                if cod.isdigit():
-                    return cod
-    except Exception:
-        pass
-
-    # 2) tenta catálogo local IBGE
-    try:
-        if ibge_local_df is not None and {"uf", "municipio_norm", "codigo_ibge"}.issubset(set(ibge_local_df.columns)):
-            hit2 = ibge_local_df[(ibge_local_df["uf"] == uf_up) & (ibge_local_df["municipio_norm"] == nome_norm)]
-            if not hit2.empty:
-                cod2 = _safe_text(hit2.iloc[0].get("codigo_ibge"))
-                if cod2.isdigit():
-                    return cod2
-    except Exception:
-        pass
-
-    # 3) fallback online IBGE
-    mapa = ibge_municipios_uf_online(uf_up)
-    cod3 = _safe_text(mapa.get(nome_norm))
-    return cod3 if cod3.isdigit() else ""
+def resolver_municipio_ibge(nome: str, uf: str) -> Optional[Dict[str, str]]:
+    df = load_municipios_ibge(uf)
+    if df.empty:
+        return None
+    hit = df[df["nome_norm"] == _norm(nome)]
+    if hit.empty:
+        return None
+    row = hit.iloc[0]
+    return {
+        "nome": _safe_text(row.get("nome")),
+        "uf": _safe_text(row.get("uf")).upper(),
+        "codigo_ibge": _safe_text(row.get("codigo_ibge")),
+    }
 
 
 # ==========================
-# Busca (API Dados Abertos)
+# API PNCP Consulta
 # ==========================
-def _status_match(item: Dict, status_value: str) -> bool:
-    if not status_value:
-        return True
-
-    situacao_id = item.get("situacaoCompraIdPncp")
-    try:
-        sit_id = int(situacao_id) if situacao_id is not None else None
-    except Exception:
-        sit_id = None
-
-    sit_nome = _norm(item.get("situacaoCompraNomePncp", ""))
-    fim_raw = _safe_text(item.get("dataEncerramentoPropostaPncp"))
-    pub_raw = _safe_text(item.get("dataPublicacaoPncp"))
-    fim_dt = pd.to_datetime(fim_raw, errors="coerce", utc=True)
-    pub_dt = pd.to_datetime(pub_raw, errors="coerce", utc=True)
-    if pd.notna(fim_dt):
-        fim_dt = fim_dt.tz_localize(None)
-    if pd.notna(pub_dt):
-        pub_dt = pub_dt.tz_localize(None)
-    now = pd.Timestamp.now(tz=None)
-
-    tem_fim = bool(pd.notna(fim_dt))
-    proposta_aberta = bool(tem_fim and fim_dt >= now)
-    proposta_encerrada = bool(tem_fim and fim_dt < now)
-    is_cancelada = sit_id in {2, 3, 4} or ("anulad" in sit_nome) or ("revogad" in sit_nome) or ("suspens" in sit_nome)
-    v_res = item.get("existeResultado", False)
-    if isinstance(v_res, str):
-        existe_resultado = _norm(v_res) in {"1", "true", "sim", "yes"}
-    else:
-        existe_resultado = bool(v_res)
-    muito_antiga_sem_fim = bool((not tem_fim) and pd.notna(pub_dt) and pub_dt < (now - pd.Timedelta(days=45)))
-
-    if status_value == "recebendo_proposta":
-        return (not is_cancelada) and proposta_aberta
-
-    if status_value == "em_julgamento":
-        return (not is_cancelada) and proposta_encerrada and (not existe_resultado)
-
-    if status_value == "encerrado":
-        return is_cancelada or existe_resultado or proposta_encerrada or muito_antiga_sem_fim
-
-    return True
-
-
-def _is_edital(item: Dict) -> bool:
-    cod = item.get("tipoInstrumentoConvocatorioCodigoPncp")
-    nome = _norm(item.get("tipoInstrumentoConvocatorioNome", ""))
-    try:
-        if cod is not None and int(cod) == 1:
-            return True
-    except Exception:
-        pass
-    return nome == "edital"
-
-
-def _status_match_consulta(status_value: str, situacao_id: Optional[int], data_encerramento: str) -> bool:
-    if not status_value:
-        return True
-
-    fim_dt = pd.to_datetime(data_encerramento, errors="coerce", utc=True)
-    if pd.notna(fim_dt):
-        fim_dt = fim_dt.tz_localize(None)
-    now = pd.Timestamp.now(tz=None)
-
-    proposta_aberta = bool(pd.isna(fim_dt) or fim_dt >= now)
-    proposta_encerrada = bool(pd.notna(fim_dt) and fim_dt < now)
-    cancelada = situacao_id in {2, 3, 4}
-
-    if status_value == "recebendo_proposta":
-        return (not cancelada) and proposta_aberta
-    if status_value == "em_julgamento":
-        return (not cancelada) and proposta_encerrada
-    if status_value == "encerrado":
-        return cancelada or proposta_encerrada
-    return True
-
-
-def _items_from_consulta_json(js) -> List[Dict]:
+def _items_from_api(js) -> List[Dict]:
+    if isinstance(js, dict) and isinstance(js.get("data"), list):
+        return js["data"]
     if isinstance(js, list):
         return js
-    if not isinstance(js, dict):
-        return []
-    for key in ["data", "items", "resultado", "results", "content"]:
-        v = js.get(key)
-        if isinstance(v, list):
-            return v
     return []
 
 
-def _request_consulta(url: str, params: Dict) -> Tuple[List[Dict], int, Optional[str]]:
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=CFG_TIMEOUT)
-    except Exception as e:
-        return [], 0, f"request_error:{e}"
+def _get_api_page(url: str, params: Dict[str, object]) -> Tuple[List[Dict], int]:
+    last_error: Optional[Exception] = None
+    for attempt in range(API_RETRIES):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT_API)
+            if r.status_code >= 500 and attempt < API_RETRIES - 1:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < API_RETRIES - 1:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            raise RuntimeError(f"request_error: {exc}") from exc
+    else:
+        raise RuntimeError(f"request_error: {last_error}")
 
     if r.status_code in (204, 404):
-        return [], 0, None
+        return [], 0
     if r.status_code >= 400:
-        return [], 0, f"http_{r.status_code}"
+        raise RuntimeError(f"HTTP {r.status_code}: {(r.text or '')[:180]}")
 
-    ctype = (r.headers.get("content-type") or "").lower()
     body = (r.text or "").strip()
-    if "json" not in ctype and not body.startswith("{") and not body.startswith("["):
-        return [], 0, "non_json"
-
-    try:
-        js = r.json()
-    except Exception as e:
-        return [], 0, f"json_error:{e}"
-
-    items = _items_from_consulta_json(js)
-    total_paginas = 0
-    if isinstance(js, dict):
-        try:
-            total_paginas = int(js.get("totalPaginas") or 0)
-        except Exception:
-            total_paginas = 0
-    return items, total_paginas, None
-
-
-def _normalizar_item_consulta(item: Dict, codigo_pncp: str, nome_municipio: str, uf: str) -> Dict:
-    unidade = item.get("unidadeOrgao") or {}
-    orgao = item.get("orgaoEntidade") or {}
-
-    numero_controle = _safe_text(item.get("numeroControlePNCP"))
-    cnpj_ctrl, ano_ctrl, seq_ctrl = _parse_numero_controle(numero_controle)
-
-    orgao_cnpj = _safe_text(orgao.get("cnpj")) or cnpj_ctrl
-    ano = _safe_text(item.get("anoCompra")) or ano_ctrl
-    seq = _safe_text(item.get("sequencialCompra")) or seq_ctrl
-
-    tipo_inst = _safe_text(item.get("tipoInstrumentoConvocatorioNome")) or "Edital"
-    numero_compra = _safe_text(item.get("numeroCompra"))
-    processo = _safe_text(item.get("processo"))
-    modalidade = _safe_text(item.get("modalidadeNome"))
-    orgao_nome = _safe_text(orgao.get("razaoSocial")) or _safe_text(orgao.get("razaosocial"))
-    objeto = _safe_text(item.get("objetoCompra")) or _safe_text(item.get("informacaoComplementar"))
-    pub_raw = _safe_text(item.get("dataPublicacaoPncp")) or _safe_text(item.get("dataAtualizacao")) or _safe_text(item.get("dataInclusao"))
-    fim_raw = _safe_text(item.get("dataEncerramentoProposta"))
-    cidade = _safe_text(unidade.get("municipioNome")) or nome_municipio
-    uf_val = _safe_text(unidade.get("ufSigla")).upper() or uf.upper()
-
-    if numero_compra and ano:
-        titulo = f"{tipo_inst} n° {numero_compra}/{ano}"
-    elif numero_compra:
-        titulo = f"{tipo_inst} n° {numero_compra}"
-    else:
-        titulo = numero_controle or "(Sem título)"
-    if processo:
-        titulo = f"{titulo} | Processo {processo}"
-
-    return {
-        "municipio_codigo": codigo_pncp,
-        "Cidade": cidade,
-        "UF": uf_val,
-        "Título": titulo,
-        "Objeto": objeto,
-        "Link para o edital": _public_edital_link(orgao_cnpj, ano, seq),
-        "Modalidade": modalidade,
-        "Tipo": tipo_inst,
-        "Tipo (documento)": tipo_inst,
-        "Orgão": orgao_nome,
-        "Unidade": _safe_text(unidade.get("nomeUnidade")),
-        "Esfera": _safe_text(orgao.get("esferaId")),
-        "Publicação": _fmt_dt_iso_to_br(pub_raw),
-        "Fim do envio de proposta": _fmt_dt_iso_to_br(fim_raw),
-        "numero_processo": processo,
-        "_pub_raw": pub_raw,
-        "_orgao_cnpj": orgao_cnpj,
-        "_ano": ano,
-        "_seq": seq,
-        "_id": _safe_text(item.get("id")) or numero_controle,
-    }
-
-
-def buscar_contratacoes_municipio_consulta(
-    codigo_pncp: str,
-    nome_municipio: str,
-    uf: str,
-    codigo_ibge: str,
-    status_value: str,
-    palavra_chave: str,
-) -> pd.DataFrame:
-    if not codigo_pncp or not nome_municipio:
-        return pd.DataFrame()
-
-    endpoint = API_CONSULTA_PROPOSTA if status_value == "recebendo_proposta" else API_CONSULTA_PUBLICACAO
-    dt_final = datetime.now().strftime("%Y%m%d")
-    dt_inicial = (datetime.now() - timedelta(days=max(1, CFG_LOOKBACK_DIAS))).strftime("%Y%m%d")
-
-    vistos = set()
-    registros: List[Dict] = []
-    teve_resposta = False
-
-    for modalidade in CFG_CONSULTA_MODALIDADES:
-        total_paginas_conhecido = 0
-        for pagina in range(1, max(1, CFG_CONSULTA_MAX_PAGINAS_MODALIDADE) + 1):
-            params: Dict[str, object] = {
-                "codigoModalidadeContratacao": int(modalidade),
-                "pagina": int(pagina),
-                "tamanhoPagina": int(CFG_CONSULTA_TAM_PAGINA),
-            }
-            if endpoint == API_CONSULTA_PROPOSTA:
-                params["dataFinal"] = dt_final
-            else:
-                params["dataInicial"] = dt_inicial
-                params["dataFinal"] = dt_final
-            if _safe_text(uf):
-                params["uf"] = _safe_text(uf).upper()
-            if _safe_text(codigo_ibge).isdigit():
-                params["codigoMunicipioIbge"] = _safe_text(codigo_ibge)
-
-            rows, total_paginas, err = _request_consulta(endpoint, params)
-            if err:
-                break
-            teve_resposta = True
-
-            if total_paginas > 0:
-                total_paginas_conhecido = total_paginas
-            if not rows:
-                break
-
-            for item in rows:
-                unidade = item.get("unidadeOrgao") or {}
-                cidade_api = _safe_text(unidade.get("municipioNome"))
-                uf_api = _safe_text(unidade.get("ufSigla")).upper()
-                ibge_api = _safe_text(unidade.get("codigoIbge"))
-
-                if _safe_text(codigo_ibge).isdigit():
-                    if ibge_api and ibge_api != _safe_text(codigo_ibge):
-                        continue
-                else:
-                    if uf_api and uf_api != _safe_text(uf).upper():
-                        continue
-                    if cidade_api and _norm(cidade_api) != _norm(nome_municipio):
-                        continue
-
-                sit_raw = item.get("situacaoCompraId")
-                try:
-                    sit_id = int(sit_raw) if sit_raw is not None else None
-                except Exception:
-                    sit_id = None
-                if not _status_match_consulta(status_value, sit_id, _safe_text(item.get("dataEncerramentoProposta"))):
-                    continue
-
-                if CFG_APENAS_EDITAL:
-                    if not _is_edital(
-                        {
-                            "tipoInstrumentoConvocatorioCodigoPncp": item.get("tipoInstrumentoConvocatorioId"),
-                            "tipoInstrumentoConvocatorioNome": item.get("tipoInstrumentoConvocatorioNome"),
-                        }
-                    ):
-                        continue
-
-                if palavra_chave:
-                    q = palavra_chave.lower()
-                    txt = " ".join(
-                        [
-                            _safe_text(item.get("objetoCompra")),
-                            _safe_text(item.get("informacaoComplementar")),
-                            _safe_text(item.get("numeroCompra")),
-                            _safe_text(item.get("processo")),
-                        ]
-                    ).lower()
-                    if q not in txt:
-                        continue
-
-                numero_controle = _safe_text(item.get("numeroControlePNCP"))
-                cnpj_ctrl, ano_ctrl, seq_ctrl = _parse_numero_controle(numero_controle)
-                key = f"{cnpj_ctrl}-{ano_ctrl}-{seq_ctrl}" if cnpj_ctrl and ano_ctrl and seq_ctrl else (_safe_text(item.get("id")) or numero_controle)
-                if not key:
-                    key = hashlib.md5(json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-                if key in vistos:
-                    continue
-                vistos.add(key)
-
-                registros.append(_normalizar_item_consulta(item, codigo_pncp, nome_municipio, uf))
-
-            if total_paginas_conhecido and pagina >= total_paginas_conhecido:
-                break
-            if len(rows) < CFG_CONSULTA_TAM_PAGINA:
-                break
-
-    if not teve_resposta or not registros:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(registros)
-    try:
-        df["_pub_dt"] = pd.to_datetime(df["_pub_raw"], errors="coerce", utc=False)
-    except Exception:
-        df["_pub_dt"] = pd.NaT
-    df.sort_values("_pub_dt", ascending=False, na_position="last", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
-
-
-def _request_contratacoes(params: Dict) -> Tuple[List[Dict], int]:
-    r = requests.get(API_DADOS_ABERTOS, params=params, headers=HEADERS, timeout=CFG_TIMEOUT)
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise RuntimeError(f"HTTP {r.status_code}: {msg[:140]}")
-
-    ctype = (r.headers.get("content-type") or "").lower()
-    body = (r.text or "").strip()
-    if "json" not in ctype and not body.startswith("{"):
-        raise RuntimeError("Resposta não-JSON do endpoint")
-    js = r.json()
-    if not isinstance(js, dict):
+    if not body:
         return [], 0
 
-    rows = js.get("resultado", [])
-    if not isinstance(rows, list):
-        rows = []
-    total_paginas = int(js.get("totalPaginas") or 0)
-    return rows, total_paginas
-
-
-def _normalizar_item_contratacao(item: Dict, codigo_pncp: str, nome_municipio: str, uf: str) -> Dict:
-    numero_controle = _safe_text(item.get("numeroControlePNCP"))
-    cnpj, ano_ctrl, seq_ctrl = _parse_numero_controle(numero_controle)
-
-    orgao_cnpj = _safe_text(item.get("orgaoEntidadeCnpj")) or cnpj
-    ano = _safe_text(item.get("anoCompraPncp")) or ano_ctrl
-    seq = _safe_text(item.get("sequencialCompraPncp")) or seq_ctrl
-
-    tipo_inst = _safe_text(item.get("tipoInstrumentoConvocatorioNome")) or "Edital"
-    numero_compra = _safe_text(item.get("numeroCompra"))
-    processo = _safe_text(item.get("processo"))
-    modalidade = _safe_text(item.get("modalidadeNome"))
-    orgao_nome = _safe_text(item.get("orgaoEntidadeRazaoSocial"))
-    objeto = _safe_text(item.get("objetoCompra")) or _safe_text(item.get("informacaoComplementar"))
-    pub_raw = _safe_text(item.get("dataPublicacaoPncp"))
-    fim_raw = _safe_text(item.get("dataEncerramentoPropostaPncp"))
-    cidade = _safe_text(item.get("unidadeOrgaoMunicipioNome")) or nome_municipio
-    uf_val = _safe_text(item.get("unidadeOrgaoUfSigla")).upper() or uf.upper()
-
-    if numero_compra and ano:
-        titulo = f"{tipo_inst} n° {numero_compra}/{ano}"
-    elif numero_compra:
-        titulo = f"{tipo_inst} n° {numero_compra}"
-    else:
-        titulo = numero_controle or "(Sem título)"
-    if processo:
-        titulo = f"{titulo} | Processo {processo}"
-
-    return {
-        "municipio_codigo": codigo_pncp,
-        "Cidade": cidade,
-        "UF": uf_val,
-        "Título": titulo,
-        "Objeto": objeto,
-        "Link para o edital": _public_edital_link(orgao_cnpj, ano, seq),
-        "Modalidade": modalidade,
-        "Tipo": tipo_inst,
-        "Tipo (documento)": tipo_inst,
-        "Orgão": orgao_nome,
-        "Unidade": _safe_text(item.get("unidadeOrgaoNomeUnidade")),
-        "Esfera": _safe_text(item.get("orgaoEntidadeEsferaId")),
-        "Publicação": _fmt_dt_iso_to_br(pub_raw),
-        "Fim do envio de proposta": _fmt_dt_iso_to_br(fim_raw),
-        "numero_processo": processo,
-        "_pub_raw": pub_raw,
-        "_orgao_cnpj": orgao_cnpj,
-        "_ano": ano,
-        "_seq": seq,
-        "_id": _safe_text(item.get("idCompra")) or numero_controle,
-    }
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def _buscar_orgaos_por_nome_municipio(municipio_nome: str) -> List[Dict]:
-    nome = _safe_text(municipio_nome)
-    if not nome or len(nome) < 3:
-        return []
-    coletados: List[Dict] = []
-    for pagina in range(1, 7):
+    js = r.json()
+    total_pages = 0
+    if isinstance(js, dict):
         try:
-            r = requests.get(
-                API_INTEGRACAO_ORGAOS,
-                params={"razaoSocial": nome, "pagina": pagina},
-                headers=HEADERS,
-                timeout=CFG_TIMEOUT,
-            )
-            if r.status_code >= 400:
-                break
-            js = r.json()
+            total_pages = int(js.get("totalPaginas") or 0)
         except Exception:
+            total_pages = 0
+    return _items_from_api(js), total_pages
+
+
+def _iter_pages(url: str, base_params: Dict[str, object]) -> List[Dict]:
+    items: List[Dict] = []
+    total_pages = 0
+    for page in range(1, MAX_PAGES_API + 1):
+        params = dict(base_params)
+        params["pagina"] = page
+        params["tamanhoPagina"] = PAGE_SIZE_API
+        page_items, total_pages = _get_api_page(url, params)
+        if not page_items:
             break
-        itens = js if isinstance(js, list) else []
-        if not itens:
+        items.extend(page_items)
+        if total_pages and page >= total_pages:
             break
-        coletados.extend(itens)
-        if len(itens) < 20:
-            break
-
-    mun_norm = _norm(nome)
-    seen = set()
-    ranked: List[Tuple[int, Dict]] = []
-    for o in coletados:
-        cnpj = _safe_text(o.get("cnpj"))
-        razao = _safe_text(o.get("razaoSocial"))
-        if len(cnpj) != 14 or cnpj in seen:
-            continue
-        seen.add(cnpj)
-        rz = _norm(razao)
-        if mun_norm and mun_norm not in rz:
-            continue
-        score = 0
-        if f"municipio_de_{mun_norm}" in rz:
-            score += 100
-        if f"prefeitura_municipal_de_{mun_norm}" in rz:
-            score += 95
-        if f"camara_municipal_de_{mun_norm}" in rz:
-            score += 90
-        if "fundo_municipal" in rz:
-            score += 40
-        if "consorcio" in rz:
-            score += 10
-        if "condominio" in rz:
-            score -= 40
-        ranked.append((score, {"cnpj": cnpj, "razao": razao}))
-
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return [x[1] for x in ranked[: max(1, CFG_SCAN_MAX_ORGAOS)]]
+    return items
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def _scan_arquivos_compra(cnpj: str, ano: int, seq: int) -> List[Dict]:
-    url = API_INTEGRACAO_ARQUIVOS.format(cnpj=cnpj, ano=ano, seq=seq)
-    r = requests.get(url, params={"pagina": 1, "tamanhoPagina": 80}, headers=HEADERS, timeout=CFG_TIMEOUT)
-    if r.status_code == 404:
-        return []
-    if r.status_code >= 400:
-        return []
-    js = r.json()
-    return js if isinstance(js, list) else []
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def _scan_itens_compra(cnpj: str, ano: int, seq: int) -> List[Dict]:
-    url = API_INTEGRACAO_ITENS.format(cnpj=cnpj, ano=ano, seq=seq)
-    r = requests.get(url, params={"pagina": 1, "tamanhoPagina": 500}, headers=HEADERS, timeout=CFG_TIMEOUT)
-    if r.status_code == 404:
-        return []
-    if r.status_code >= 400:
-        return []
-    js = r.json()
-    return js if isinstance(js, list) else []
-
-
-def _status_match_scan(status_value: str, status_names: set[str]) -> bool:
+def _status_match_publicacao(item: Dict, status_value: str) -> bool:
     if not status_value:
         return True
-    has_andamento = ("em_andamento" in status_names) or ("pendente" in status_names)
-    has_encerrado = bool(status_names.intersection({"homologado", "fracassado", "deserto", "anulado_revogado_cancelado"}))
-    if status_value == "recebendo_proposta":
-        return has_andamento
+
+    situacao = _safe_text(item.get("situacaoCompraId"))
+    fim = pd.to_datetime(item.get("dataEncerramentoProposta"), errors="coerce", utc=False)
+    now = pd.Timestamp.now()
+
+    encerrada_por_data = bool(pd.notna(fim) and fim < now)
+    cancelada_ou_final = situacao in {"2", "3", "4"}
+
     if status_value == "em_julgamento":
-        return has_andamento or has_encerrado
+        return situacao == "1" and encerrada_por_data
     if status_value == "encerrado":
-        return (not has_andamento) and has_encerrado
+        return cancelada_ou_final or encerrada_por_data
     return True
 
 
-def _normalizar_item_scan(
-    codigo_pncp: str,
-    nome_municipio: str,
-    uf: str,
-    cnpj: str,
-    orgao_nome: str,
-    ano: int,
-    seq: int,
-    doc_titulo: str,
-    doc_tipo: str,
-    pub_raw: str,
-    objeto: str,
-) -> Dict:
-    titulo = _safe_text(doc_titulo)
-    if not titulo or _norm(titulo) in {"capa_licitacao", "edital", "aviso"}:
-        titulo = f"Edital n° {seq}/{ano}"
+def _normalizar_item(item: Dict, municipio_ref: Dict[str, str]) -> Dict:
+    orgao = _first_dict(item.get("orgaoSubRogado"), item.get("orgaoEntidade"))
+    unidade = _first_dict(item.get("unidadeSubRogada"), item.get("unidadeOrgao"))
+
+    numero_controle = _safe_text(item.get("numeroControlePNCP"))
+    ctrl_cnpj, ctrl_ano, ctrl_seq = _parse_numero_controle(numero_controle)
+
+    cnpj = _safe_text(orgao.get("cnpj")) or ctrl_cnpj
+    ano = _safe_text(item.get("anoCompra")) or ctrl_ano
+    seq = _safe_text(item.get("sequencialCompra")) or ctrl_seq
+    numero = _safe_text(item.get("numeroCompra"))
+    processo = _safe_text(item.get("processo"))
+    tipo = _safe_text(item.get("tipoInstrumentoConvocatorioNome")) or "Edital"
+
+    if numero and ano:
+        titulo = f"{tipo} n° {numero}/{ano}"
+    elif numero:
+        titulo = f"{tipo} n° {numero}"
+    else:
+        titulo = numero_controle or "(Sem titulo)"
+    if processo:
+        titulo = f"{titulo} | Processo {processo}"
+
+    cidade = _safe_text(unidade.get("municipioNome")) or _safe_text(municipio_ref.get("nome"))
+    uf = _safe_text(unidade.get("ufSigla")).upper() or _safe_text(municipio_ref.get("uf")).upper()
+    pub_raw = _safe_text(item.get("dataPublicacaoPncp")) or _safe_text(item.get("dataInclusao"))
+    fim_raw = _safe_text(item.get("dataEncerramentoProposta"))
+
     return {
-        "municipio_codigo": codigo_pncp,
-        "Cidade": nome_municipio,
-        "UF": _safe_text(uf).upper(),
-        "Título": titulo,
-        "Objeto": _safe_text(objeto),
-        "Link para o edital": _public_edital_link(cnpj, str(ano), str(seq)),
-        "Modalidade": "",
-        "Tipo": _safe_text(doc_tipo) or "Edital",
-        "Tipo (documento)": _safe_text(doc_tipo) or "Edital",
-        "Orgão": _safe_text(orgao_nome),
-        "Unidade": "",
-        "Esfera": "",
-        "Publicação": _fmt_dt_iso_to_br(pub_raw),
-        "Fim do envio de proposta": "",
-        "numero_processo": "",
-        "_pub_raw": _safe_text(pub_raw),
-        "_orgao_cnpj": _safe_text(cnpj),
-        "_ano": str(ano),
-        "_seq": str(seq),
-        "_id": f"{cnpj}-{ano}-{seq}",
+        "municipio_codigo": _safe_text(municipio_ref.get("codigo_ibge")),
+        "Cidade": cidade,
+        "UF": uf,
+        "Titulo": titulo,
+        "Objeto": _safe_text(item.get("objetoCompra")),
+        "Link para o edital": _build_pncp_link(cnpj, ano, seq),
+        "Modalidade": _safe_text(item.get("modalidadeNome")),
+        "Tipo": tipo,
+        "Tipo (documento)": tipo,
+        "Orgao": _safe_text(orgao.get("razaoSocial")),
+        "Unidade": _safe_text(unidade.get("nomeUnidade")),
+        "Esfera": _safe_text(orgao.get("esferaId")),
+        "Publicacao": _fmt_dt_iso_to_br(pub_raw),
+        "Fim do envio de proposta": _fmt_dt_iso_to_br(fim_raw),
+        "numero_processo": processo,
+        "_pub_raw": pub_raw,
+        "_orgao_cnpj": cnpj,
+        "_ano": ano,
+        "_seq": seq,
+        "_id": numero_controle,
     }
 
 
-def buscar_contratacoes_municipio_scan_integracao(
-    codigo_pncp: str,
-    nome_municipio: str,
-    uf: str,
-    status_value: str,
-    palavra_chave: str,
-) -> pd.DataFrame:
-    orgaos = _buscar_orgaos_por_nome_municipio(nome_municipio)
-    if not orgaos:
-        return pd.DataFrame()
+def _dedupe_key(item: Dict) -> str:
+    key = _safe_text(item.get("numeroControlePNCP"))
+    if key:
+        return key
+    orgao = _first_dict(item.get("orgaoEntidade"))
+    raw = "|".join(
+        [
+            _safe_text(orgao.get("cnpj")),
+            _safe_text(item.get("anoCompra")),
+            _safe_text(item.get("sequencialCompra")),
+            _safe_text(item.get("numeroCompra")),
+        ]
+    )
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
-    anos = [datetime.now().year - i for i in range(max(0, CFG_SCAN_ANOS_LOOKBACK) + 1)]
-    vistos = set()
+
+def buscar_municipio_api(municipio: Dict[str, str], status_value: str, q: str) -> Tuple[List[Dict], List[str]]:
+    codigo_ibge = _safe_text(municipio.get("codigo_ibge"))
+    uf = _safe_text(municipio.get("uf")).upper()
     registros: List[Dict] = []
-    q = _safe_text(palavra_chave).lower()
+    erros: List[str] = []
+    vistos = set()
 
-    for org in orgaos:
-        cnpj = _safe_text(org.get("cnpj"))
-        orgao_nome = _safe_text(org.get("razao"))
-        if len(cnpj) != 14:
-            continue
-
-        for ano in anos:
-            misses = 0
-            for seq in range(1, max(1, CFG_SCAN_MAX_SEQ) + 1):
-                arqs = _scan_arquivos_compra(cnpj, int(ano), int(seq))
-                if not arqs:
-                    misses += 1
-                    if seq > 30 and misses >= CFG_SCAN_MISS_STREAK_STOP:
-                        break
-                    continue
-                misses = 0
-
-                docs = [
-                    a for a in arqs
-                    if "edital" in _norm(a.get("tipoDocumentoNome", "")) or "aviso" in _norm(a.get("tipoDocumentoNome", ""))
-                ]
-                if not docs:
-                    continue
-
-                itens = _scan_itens_compra(cnpj, int(ano), int(seq))
-                status_names = {
-                    _norm(i.get("situacaoCompraItemNome", ""))
-                    for i in itens
-                    if _safe_text(i.get("situacaoCompraItemNome"))
-                }
-                if not _status_match_scan(status_value, status_names):
-                    continue
-
-                docs_sorted = sorted(
-                    docs,
-                    key=lambda d: (0 if _norm(d.get("titulo", "")) in {"capa_licitacao", "edital", "aviso"} else 1, _safe_text(d.get("dataPublicacaoPncp"))),
-                    reverse=True,
+    try:
+        if status_value == "recebendo_proposta":
+            data_final = (datetime.now() + timedelta(days=PROPOSTA_DIAS_A_FRENTE)).strftime("%Y%m%d")
+            try:
+                rows = _iter_pages(
+                    API_CONSULTA_PROPOSTA,
+                    {
+                        "dataFinal": data_final,
+                        "uf": uf,
+                        "codigoMunicipioIbge": codigo_ibge,
+                    },
                 )
-                doc = docs_sorted[0]
-
-                titulo_doc = _safe_text(doc.get("titulo"))
-                tipo_doc = _safe_text(doc.get("tipoDocumentoNome")) or "Edital"
-                pub_candidates = [_safe_text(a.get("dataPublicacaoPncp")) for a in docs if _safe_text(a.get("dataPublicacaoPncp"))]
-                pub_raw = sorted(pub_candidates)[-1] if pub_candidates else ""
-
-                objeto = ""
-                if itens:
-                    for it in itens:
-                        cand = _safe_text(it.get("descricao")) or _safe_text(it.get("informacaoComplementar"))
-                        if cand:
-                            objeto = cand
-                            break
-
-                txt_q = " ".join([titulo_doc, objeto, tipo_doc]).lower()
-                if q and q not in txt_q:
-                    continue
-
-                key = f"{cnpj}-{ano}-{seq}"
-                if key in vistos:
-                    continue
-                vistos.add(key)
-
-                registros.append(
-                    _normalizar_item_scan(
-                        codigo_pncp=codigo_pncp,
-                        nome_municipio=nome_municipio,
-                        uf=uf,
-                        cnpj=cnpj,
-                        orgao_nome=orgao_nome,
-                        ano=int(ano),
-                        seq=int(seq),
-                        doc_titulo=titulo_doc,
-                        doc_tipo=tipo_doc,
-                        pub_raw=pub_raw,
-                        objeto=objeto,
+            except Exception as exc_agregado:
+                rows = []
+                erros_modalidade: List[str] = []
+                for modalidade in MODALIDADES_CONSULTA:
+                    try:
+                        rows.extend(
+                            _iter_pages(
+                                API_CONSULTA_PROPOSTA,
+                                {
+                                    "dataFinal": data_final,
+                                    "codigoModalidadeContratacao": modalidade,
+                                    "uf": uf,
+                                    "codigoMunicipioIbge": codigo_ibge,
+                                },
+                            )
+                        )
+                    except Exception as exc_modalidade:
+                        erros_modalidade.append(f"modalidade {modalidade}: {exc_modalidade}")
+                if not rows:
+                    detalhe = "; ".join(erros_modalidade[:3])
+                    erros.append(f"{municipio.get('nome')} / {uf}: consulta agregada falhou ({exc_agregado}); {detalhe}")
+        else:
+            data_final = datetime.now().strftime("%Y%m%d")
+            data_inicial = (datetime.now() - timedelta(days=PUBLICACAO_DIAS_LOOKBACK)).strftime("%Y%m%d")
+            rows = []
+            for modalidade in MODALIDADES_CONSULTA:
+                rows.extend(
+                    _iter_pages(
+                        API_CONSULTA_PUBLICACAO,
+                        {
+                            "dataInicial": data_inicial,
+                            "dataFinal": data_final,
+                            "codigoModalidadeContratacao": modalidade,
+                            "uf": uf,
+                            "codigoMunicipioIbge": codigo_ibge,
+                        },
                     )
                 )
+    except Exception as exc:
+        erros.append(f"{municipio.get('nome')} / {uf}: {exc}")
+        rows = []
 
-    if not registros:
-        return pd.DataFrame()
+    q_norm = _norm(q)
+    for item in rows:
+        if status_value != "recebendo_proposta" and not _status_match_publicacao(item, status_value):
+            continue
 
-    df = pd.DataFrame(registros)
-    try:
-        df["_pub_dt"] = pd.to_datetime(df["_pub_raw"], errors="coerce", utc=False)
-    except Exception:
-        df["_pub_dt"] = pd.NaT
-    df.sort_values("_pub_dt", ascending=False, na_position="last", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
+        key = _dedupe_key(item)
+        if key in vistos:
+            continue
+        vistos.add(key)
+
+        registro = _normalizar_item(item, municipio)
+
+        if q_norm:
+            alvo = _norm(
+                " ".join(
+                    [
+                        registro.get("Titulo", ""),
+                        registro.get("Objeto", ""),
+                        registro.get("Orgao", ""),
+                        registro.get("Modalidade", ""),
+                    ]
+                )
+            )
+            if q_norm not in alvo:
+                continue
+
+        registros.append(registro)
+
+    return registros, erros
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def buscar_contratacoes_municipio(
-    codigo_pncp: str,
-    nome_municipio: str,
-    uf: str,
-    codigo_ibge: str,
-    status_value: str,
-    palavra_chave: str,
-) -> pd.DataFrame:
-    # Fluxo backup: API de Dados Abertos Compras.gov (independente do /api/search PNCP)
-    if not codigo_pncp or not nome_municipio:
-        return pd.DataFrame()
-
-    data_final = datetime.now().strftime("%Y-%m-%d")
-    data_inicial = (datetime.now() - timedelta(days=max(1, CFG_LOOKBACK_DIAS))).strftime("%Y-%m-%d")
-
-    vistos = set()
+def coletar_por_assinatura(signature: dict) -> Tuple[List[Dict], List[str]]:
     registros: List[Dict] = []
+    erros: List[str] = []
 
-    for modalidade in CFG_MODALIDADES:
-        for pagina in range(1, max(1, CFG_MAX_PAGINAS_MODALIDADE) + 1):
-            params: Dict[str, object] = {
-                "pagina": pagina,
-                "tamanhoPagina": CFG_TAM_PAGINA_API,
-                "dataPublicacaoPncpInicial": data_inicial,
-                "dataPublicacaoPncpFinal": data_final,
-                "codigoModalidade": int(modalidade),
-                "unidadeOrgaoUfSigla": uf.upper(),
-                "contratacaoExcluida": "false",
-            }
-            if _safe_text(codigo_ibge).isdigit():
-                params["unidadeOrgaoCodigoIbge"] = int(codigo_ibge)
-
-            try:
-                rows, total_paginas = _request_contratacoes(params)
-            except Exception:
-                break
-
-            if not rows:
-                break
-
-            for item in rows:
-                if CFG_APENAS_EDITAL and not _is_edital(item):
-                    continue
-
-                # reforço de município (quando IBGE não vier no payload por inconsistência de origem)
-                cidade_api = _safe_text(item.get("unidadeOrgaoMunicipioNome"))
-                uf_api = _safe_text(item.get("unidadeOrgaoUfSigla")).upper()
-                if uf_api and uf_api != uf.upper():
-                    continue
-                if cidade_api and _norm(cidade_api) != _norm(nome_municipio):
-                    continue
-
-                if not _status_match(item, status_value):
-                    continue
-
-                if palavra_chave:
-                    titulo_q = _safe_text(item.get("numeroCompra")) + " " + _safe_text(item.get("processo"))
-                    obj_q = _safe_text(item.get("objetoCompra")) + " " + _safe_text(item.get("informacaoComplementar"))
-                    txt = f"{titulo_q} {obj_q}".lower()
-                    if palavra_chave.lower() not in txt:
-                        continue
-
-                key = _safe_text(item.get("idCompra")) or _safe_text(item.get("numeroControlePNCP"))
-                if not key:
-                    key = hashlib.md5(json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-                if key in vistos:
-                    continue
-                vistos.add(key)
-
-                registros.append(_normalizar_item_contratacao(item, codigo_pncp, nome_municipio, uf))
-
-            if total_paginas and pagina >= total_paginas:
-                break
+    for municipio in signature.get("municipios_meta", []):
+        rows, err = buscar_municipio_api(
+            municipio=municipio,
+            status_value=_safe_text(signature.get("status")),
+            q=_safe_text(signature.get("q")),
+        )
+        registros.extend(rows)
+        erros.extend(err)
 
     if not registros:
-        return pd.DataFrame()
+        return [], erros
 
     df = pd.DataFrame(registros)
     try:
@@ -1240,44 +639,15 @@ def buscar_contratacoes_municipio(
         df["_pub_dt"] = pd.NaT
     df.sort_values("_pub_dt", ascending=False, na_position="last", inplace=True)
     df.reset_index(drop=True, inplace=True)
-    return df
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def coletar_por_assinatura(signature: dict) -> pd.DataFrame:
-    registros: List[pd.DataFrame] = []
-    for m in signature.get("municipios_meta", []):
-        df_m = buscar_contratacoes_municipio(
-            codigo_pncp=_safe_text(m.get("codigo_pncp")),
-            nome_municipio=_safe_text(m.get("nome")),
-            uf=_safe_text(m.get("uf")),
-            codigo_ibge=_safe_text(m.get("codigo_ibge")),
-            status_value=_safe_text(signature.get("status")),
-            palavra_chave=_safe_text(signature.get("q")),
-        )
-        if not df_m.empty:
-            registros.append(df_m)
-
-    if not registros:
-        return pd.DataFrame()
-
-    df = pd.concat(registros, ignore_index=True)
-    if "_pub_dt" not in df.columns:
-        try:
-            df["_pub_dt"] = pd.to_datetime(df["_pub_raw"], errors="coerce", utc=False)
-        except Exception:
-            df["_pub_dt"] = pd.NaT
-    df.sort_values("_pub_dt", ascending=False, na_position="last", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
+    return df.to_dict("records"), erros
 
 
 # ==========================
-# Estado
+# Estado e sidebar
 # ==========================
 def _ensure_session_state() -> None:
     if "selected_municipios" not in st.session_state:
-        st.session_state.selected_municipios = []  # [{codigo_pncp,nome,uf,codigo_ibge}]
+        st.session_state.selected_municipios = []
     if "saved_searches" not in st.session_state:
         st.session_state.saved_searches = _load_saved_searches()
     if "sidebar_inputs" not in st.session_state:
@@ -1296,99 +666,56 @@ def _ensure_session_state() -> None:
         st.session_state.results_df = None
     if "results_signature" not in st.session_state:
         st.session_state.results_signature = None
+    if "result_errors" not in st.session_state:
+        st.session_state.result_errors = []
     if "card_page" not in st.session_state:
         st.session_state.card_page = 1
     if "page_size_cards" not in st.session_state:
-        st.session_state.page_size_cards = TAM_PAGINA_CARDS_PADRAO
+        st.session_state.page_size_cards = 10
     if "tr_marks" not in st.session_state:
-        st.session_state.tr_marks = _load_marks("tr_marks.json", TR_MARKS_PATHS)
+        st.session_state.tr_marks = _load_marks("tr_marks.json", TR_MARKS_LOCAL)
     if "na_marks" not in st.session_state:
-        st.session_state.na_marks = _load_marks("na_marks.json", NA_MARKS_PATHS)
+        st.session_state.na_marks = _load_marks("na_marks.json", NA_MARKS_LOCAL)
 
 
-def _add_municipio_by_name(nome: str, uf: str, pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]) -> None:
-    if not nome:
-        return
+def _normalize_municipio_payload(m: Dict) -> Optional[Dict[str, str]]:
+    nome = _safe_text(m.get("nome") or m.get("municipio") or m.get("Cidade"))
+    uf = _safe_text(m.get("uf") or m.get("UF")).upper()
+    codigo_ibge = _safe_text(m.get("codigo_ibge") or m.get("codigoIbge") or m.get("ibge"))
+
+    if nome and uf and codigo_ibge.isdigit():
+        return {"nome": nome, "uf": uf, "codigo_ibge": codigo_ibge}
+    if nome and uf:
+        return resolver_municipio_ibge(nome, uf)
+    return None
+
+
+def _add_municipio(row: Dict[str, str]) -> None:
     if len(st.session_state.selected_municipios) >= MAX_MUNICIPIOS:
-        st.warning(f"Limite de {MAX_MUNICIPIOS} municípios por pesquisa atingido.")
+        st.warning(f"Limite de {MAX_MUNICIPIOS} municipios por pesquisa atingido.")
         return
-
-    nome_norm = _norm(nome)
-    candidatos = pncp_df.copy()
-    if "uf" in candidatos.columns and uf:
-        candidatos = candidatos[candidatos["uf"].str.upper() == uf.upper()]
-    candidatos = candidatos[candidatos["nome_norm"] == nome_norm]
-    if candidatos.empty:
-        candidatos = pncp_df[pncp_df["nome_norm"] == nome_norm]
-    if candidatos.empty:
-        st.error(f"Não localizei o município '{nome}' na planilha PNCP.")
-        return
-
-    row = candidatos.iloc[0]
-    codigo = _safe_text(row.get("codigo_pncp"))
+    codigo = _safe_text(row.get("codigo_ibge"))
     if not codigo:
-        st.error(f"Município '{nome}' sem código PNCP na planilha.")
         return
-    if codigo in [m["codigo_pncp"] for m in st.session_state.selected_municipios]:
+    if codigo in [m.get("codigo_ibge") for m in st.session_state.selected_municipios]:
         return
-
-    codigo_ibge = resolver_codigo_ibge(
-        nome_municipio=_safe_text(row.get("nome")) or nome,
-        uf=_safe_text(row.get("uf")) or uf,
-        pncp_df=pncp_df,
-        ibge_local_df=ibge_df,
-        codigo_ibge_existente=_safe_text(row.get("codigo_ibge")),
-    )
     st.session_state.selected_municipios.append(
         {
-            "codigo_pncp": codigo,
-            "nome": _safe_text(row.get("nome")) or nome,
-            "uf": _safe_text(row.get("uf")) or uf,
-            "codigo_ibge": codigo_ibge,
+            "nome": _safe_text(row.get("nome")),
+            "uf": _safe_text(row.get("uf")).upper(),
+            "codigo_ibge": codigo,
         }
     )
 
 
-def _normalize_saved_municipios(raw: List[Dict], pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]) -> List[Dict]:
-    out: List[Dict] = []
-    for m in raw or []:
-        codigo = _safe_text(m.get("codigo_pncp"))
-        nome = _safe_text(m.get("nome"))
-        uf = _safe_text(m.get("uf")).upper()
-        codigo_ibge = _safe_text(m.get("codigo_ibge"))
-        if not codigo or not nome:
-            continue
-        if not codigo_ibge:
-            codigo_ibge = resolver_codigo_ibge(nome, uf, pncp_df, ibge_df, "")
-        out.append(
-            {
-                "codigo_pncp": codigo,
-                "nome": nome,
-                "uf": uf,
-                "codigo_ibge": codigo_ibge,
-            }
-        )
-    # remove duplicados por código
-    seen = set()
-    uniq = []
-    for m in out:
-        c = m["codigo_pncp"]
-        if c in seen:
-            continue
-        seen.add(c)
-        uniq.append(m)
-    return uniq
-
-
-def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]) -> bool:
-    st.sidebar.header("🔎 Filtros")
+def _sidebar() -> bool:
+    st.sidebar.header("Filtros")
 
     palavra = st.sidebar.text_input(
-        "Palavra-chave (aplicada no título/objeto):",
+        "Palavra-chave (titulo/objeto/orgao):",
         value=st.session_state.sidebar_inputs["palavra_chave"],
         key="palavra_chave_input",
     )
-
     status_label = st.sidebar.radio(
         "Status",
         STATUS_LABELS,
@@ -1396,19 +723,15 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]) -> bool:
         if st.session_state.sidebar_inputs["status_label"] in STATUS_LABELS
         else 0,
         key="status_radio",
-        help="Filtro de status aplicado sobre situação da contratação + data de encerramento de proposta.",
     )
 
-    if ibge_df is not None:
-        ufs = sorted(ibge_df["uf"].dropna().astype(str).str.upper().unique().tolist())
-    else:
-        ufs = sorted(pncp_df["uf"].dropna().astype(str).str.upper().unique().tolist()) if "uf" in pncp_df.columns else []
-    ufs = [UF_PLACEHOLDER] + [u for u in ufs if u]
-
+    uf_options = [UF_PLACEHOLDER] + UFS
     uf = st.sidebar.selectbox(
-        "Estado (UF) — Obrigatório:",
-        ufs,
-        index=ufs.index(st.session_state.sidebar_inputs["uf"]) if st.session_state.sidebar_inputs["uf"] in ufs else 0,
+        "Estado (UF) - Obrigatorio:",
+        uf_options,
+        index=uf_options.index(st.session_state.sidebar_inputs["uf"])
+        if st.session_state.sidebar_inputs["uf"] in uf_options
+        else 0,
         key="uf_select",
     )
 
@@ -1416,42 +739,40 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]) -> bool:
         st.session_state.uf_prev = uf
         st.session_state.municipio_nonce += 1
 
-    st.sidebar.markdown(f"**Municípios (máx. {MAX_MUNICIPIOS})**")
+    st.sidebar.markdown("**Municipios (max. 25)**")
     if uf == UF_PLACEHOLDER:
-        st.sidebar.info("Selecione uma UF para habilitar os municípios.")
+        st.sidebar.info("Selecione uma UF para habilitar os municipios.")
+        mun_df = pd.DataFrame()
+        chosen = "—"
         add_clicked = False
-        chosen = None
-        mun_options = []
     else:
-        if ibge_df is not None:
-            df_show = ibge_df[ibge_df["uf"] == uf].copy()
-            df_show["label"] = df_show["municipio"] + " / " + df_show["uf"]
-            mun_options = df_show[["municipio", "uf", "label"]].values.tolist()
-        else:
-            df_temp = pncp_df[pncp_df["uf"].str.upper() == uf.upper()].copy() if "uf" in pncp_df.columns else pncp_df.copy()
-            df_temp["label"] = df_temp["nome"] + " / " + uf
-            mun_options = df_temp[["nome", "uf", "label"]].values.tolist()
-
-        labels = ["—"] + [r[2] for r in mun_options]
-        chosen = st.sidebar.selectbox(
-            "Adicionar município:",
-            labels,
-            index=0,
-            key=f"municipio_select_{st.session_state.municipio_nonce}",
-        )
-        add_clicked = st.sidebar.button(
-            "➕ Adicionar município",
-            key=f"add_mun_btn_{st.session_state.municipio_nonce}",
-            use_container_width=True,
-        )
+        try:
+            mun_df = load_municipios_ibge(uf)
+            labels = ["—"] + mun_df["label"].tolist()
+            chosen = st.sidebar.selectbox(
+                "Adicionar municipio:",
+                labels,
+                index=0,
+                key=f"municipio_select_{st.session_state.municipio_nonce}",
+            )
+            add_clicked = st.sidebar.button(
+                "Adicionar municipio",
+                use_container_width=True,
+                key=f"add_mun_btn_{st.session_state.municipio_nonce}",
+            )
+        except Exception as exc:
+            st.sidebar.error(f"Falha ao carregar municipios do IBGE: {exc}")
+            mun_df = pd.DataFrame()
+            chosen = "—"
+            add_clicked = False
 
     if add_clicked:
         if chosen == "—":
-            st.sidebar.warning("Selecione um município antes de adicionar.")
+            st.sidebar.warning("Selecione um municipio antes de adicionar.")
         else:
-            row = next((r for r in mun_options if r[2] == chosen), None)
-            if row:
-                _add_municipio_by_name(row[0], row[1], pncp_df, ibge_df)
+            hit = mun_df[mun_df["label"] == chosen]
+            if not hit.empty:
+                _add_municipio(hit.iloc[0].to_dict())
 
     if st.session_state.selected_municipios:
         st.sidebar.caption("Selecionados:")
@@ -1459,10 +780,9 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]) -> bool:
         for m in st.session_state.selected_municipios:
             c1, c2 = st.sidebar.columns([0.82, 0.18])
             with c1:
-                ibge_show = f" | IBGE {m.get('codigo_ibge','')}" if _safe_text(m.get("codigo_ibge")) else ""
-                st.markdown(f"- **{m['nome']}** / {m.get('uf','')} (`{m['codigo_pncp']}`{ibge_show})")
+                st.markdown(f"- **{m['nome']}** / {m.get('uf','')} (`IBGE {m.get('codigo_ibge','')}`)")
             with c2:
-                if st.button("✕", key=f"rm_{m['codigo_pncp']}", help=f"Remover {m['nome']}"):
+                if st.button("x", key=f"rm_{m.get('codigo_ibge')}", help=f"Remover {m.get('nome')}"):
                     pass
                 else:
                     keep.append(m)
@@ -1470,7 +790,7 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]) -> bool:
             st.session_state.selected_municipios = keep
             st.rerun()
 
-    st.sidebar.subheader("💾 Pesquisa salva")
+    st.sidebar.subheader("Pesquisa salva")
     save_name = st.sidebar.text_input(
         "Nome da pesquisa",
         value=st.session_state.sidebar_inputs["save_name"],
@@ -1482,48 +802,51 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]) -> bool:
     with col_s2:
         excluir = st.button("Excluir", use_container_width=True, key="btn_excluir")
 
+    if excluir:
+        name = save_name.strip()
+        if name and name in st.session_state.saved_searches:
+            del st.session_state.saved_searches[name]
+            _persist_saved_searches(st.session_state.saved_searches)
+            st.sidebar.success(f"Pesquisa '{name}' excluida.")
+        else:
+            st.sidebar.error("Informe o nome exato de uma pesquisa salva.")
+
     if salvar:
-        nm = _safe_text(save_name)
-        if not nm:
+        name = save_name.strip()
+        if not name:
             st.sidebar.error("Informe um nome para salvar.")
         else:
-            st.session_state.saved_searches[nm] = {
+            st.session_state.saved_searches[name] = {
                 "palavra_chave": palavra,
                 "status_label": status_label,
                 "uf": uf,
                 "municipios": st.session_state.selected_municipios,
             }
             _persist_saved_searches(st.session_state.saved_searches)
-            st.sidebar.success(f"Pesquisa '{nm}' salva.")
+            st.sidebar.success(f"Pesquisa '{name}' salva.")
 
-    if excluir:
-        nm = _safe_text(save_name)
-        if nm and nm in st.session_state.saved_searches:
-            del st.session_state.saved_searches[nm]
-            _persist_saved_searches(st.session_state.saved_searches)
-            st.sidebar.success(f"Pesquisa '{nm}' excluída.")
-        else:
-            st.sidebar.error("Informe o nome exato de uma pesquisa salva para excluir.")
+    st.sidebar.subheader("Pesquisas salvas")
+    saved_names = sorted(st.session_state.saved_searches.keys())
+    selected_saved = st.sidebar.selectbox("Carregar pesquisa", ["—"] + saved_names, index=0, key="select_saved")
+    carregar = st.sidebar.button("Carregar", use_container_width=True, key="btn_carregar")
 
-    st.sidebar.subheader("📚 Pesquisas salvas")
-    nomes = sorted(list(st.session_state.saved_searches.keys()))
-    selected_saved = st.sidebar.selectbox("Carregar pesquisa", ["—"] + nomes, index=0, key="select_saved")
-    carregar = st.sidebar.button("Carregar", key="btn_carregar", use_container_width=True)
-
-    if carregar and selected_saved != "—":
+    if carregar and selected_saved and selected_saved != "—":
         payload = st.session_state.saved_searches.get(selected_saved, {})
+        municipios: List[Dict[str, str]] = []
+        for raw in payload.get("municipios", []):
+            if isinstance(raw, dict):
+                normalized = _normalize_municipio_payload(raw)
+                if normalized:
+                    municipios.append(normalized)
+
         st.session_state.sidebar_inputs["palavra_chave"] = _safe_text(payload.get("palavra_chave"))
         saved_status = _safe_text(payload.get("status_label"))
         st.session_state.sidebar_inputs["status_label"] = saved_status if saved_status in STATUS_LABELS else STATUS_LABELS[0]
         st.session_state.sidebar_inputs["uf"] = _safe_text(payload.get("uf")) or UF_PLACEHOLDER
+        st.session_state.sidebar_inputs["save_name"] = selected_saved
+        st.session_state.selected_municipios = municipios
         st.session_state.uf_prev = st.session_state.sidebar_inputs["uf"]
         st.session_state.municipio_nonce += 1
-        st.session_state.selected_municipios = _normalize_saved_municipios(
-            payload.get("municipios", []),
-            pncp_df,
-            ibge_df,
-        )
-        st.session_state.sidebar_inputs["save_name"] = selected_saved
         st.sidebar.success(f"Pesquisa '{selected_saved}' carregada.")
         st.rerun()
 
@@ -1533,39 +856,29 @@ def _sidebar(pncp_df: pd.DataFrame, ibge_df: Optional[pd.DataFrame]) -> bool:
     st.session_state.sidebar_inputs["save_name"] = save_name
     st.session_state.sidebar_inputs["selected_saved"] = selected_saved
 
-    disparar = st.sidebar.button("🔎 Pesquisar", use_container_width=True, type="primary", key="btn_pesquisar")
-    if disparar and uf == UF_PLACEHOLDER:
-        st.sidebar.error("Selecione uma UF para habilitar a pesquisa.")
-        disparar = False
-    return disparar
+    pesquisar = st.sidebar.button("Pesquisar", use_container_width=True, type="primary", key="btn_pesquisar")
+    if pesquisar and uf == UF_PLACEHOLDER:
+        st.sidebar.error("Selecione uma UF para pesquisar.")
+        pesquisar = False
+    return pesquisar
 
 
-def _cb_prev(total_pages: int):
+def _cb_prev(total_pages: int) -> None:
     st.session_state.card_page = max(1, int(st.session_state.get("card_page", 1)) - 1)
 
 
-def _cb_next(total_pages: int):
+def _cb_next(total_pages: int) -> None:
     st.session_state.card_page = min(total_pages, int(st.session_state.get("card_page", 1)) + 1)
 
 
-def _cb_page_size_change():
+def _cb_page_size_change() -> None:
     st.session_state.card_page = 1
 
 
 # ==========================
-# UI
+# UI principal
 # ==========================
-def main():
-    st.title("📑 Acerte Licitações — O seu Buscador de Editais (Backup)")
-    st.caption(
-        "Versão de contingência com busca alternativa (API de Dados Abertos). "
-        "Selecione UF e municípios, depois clique em Pesquisar."
-    )
-    st.caption(
-        "Motor de busca: primeiro API Consultas do PNCP; "
-        "se indisponível, fallback automático para API de Dados Abertos."
-    )
-
+def _inject_css() -> None:
     st.markdown(
         """
         <style>
@@ -1581,10 +894,6 @@ def main():
           background: #1f4ba8 !important;
           border: 1px solid #173a83 !important;
         }
-        section[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
-          background: #173a83 !important;
-          border-color: #122e67 !important;
-        }
         header[data-testid="stHeader"] { background: transparent !important; box-shadow: none !important; height: 3rem; }
         div.block-container { padding-top: 2.1rem; background: #f7faff; padding-bottom: 2rem; }
         .stDownloadButton > button {
@@ -1594,75 +903,55 @@ def main():
           font-size: 0.7rem !important;
           padding: 0.28rem 0.6rem !important;
         }
-        .stDownloadButton > button:hover {
-          background: #173a83 !important;
-          border-color: #122e67 !important;
-        }
         .ac-card {
-          background: #f3f6fb;
-          border: 1px solid #b9d0ee;
-          border-radius: 16px;
-          padding: 1.25rem 1.15rem;
+          background: #f8fbff;
+          border: 1.25px solid #cad9f3;
+          border-radius: 18px;
+          padding: 1.05rem 1.2rem;
           margin-bottom: 1rem;
-          box-shadow: none;
+          box-shadow: 0 8px 20px rgba(20, 45, 110, 0.06);
         }
-        .ac-card h3 {
-          margin-top: 0;
-          margin-bottom: 0.7rem;
-          font-size: 1.85rem;
-          font-weight: 700;
-          color: #0b1b36;
-          letter-spacing: -0.01em;
-        }
-        .ac-muted { color: #2b4677; font-size: 0.95rem; margin-bottom: 0.65rem; }
-        .ac-obj { margin-top: 0.2rem; margin-bottom: 0.8rem; font-size: 1.04rem; color: #0b1b36; }
-        .ac-meta { margin-top: 0.2rem; font-size: 1rem; color: #0b1b36; }
-        .ac-actions { display:flex; justify-content:flex-end; margin-top: 0.9rem; }
+        .ac-card h3 { margin-top: 0; margin-bottom: 0.25rem; font-size: 1.08rem; color: #0b1b36; }
+        .ac-muted { color: #415477; font-size: 0.92rem; }
         .ac-badge {
-          background: #eaf1ff; border: 1px solid #bcd0f7; color: #2d62b3;
+          background: #eaf1ff; border: 1px solid #bcd0f7; color: #0b3b8a;
           padding: 0.18rem 0.5rem; border-radius: 999px; font-size: 0.82rem;
         }
+        .ac-flag {
+          background: #e3f9e5; border: 1px solid #57b26a; color: #1b6f37;
+          padding: 0.18rem 0.5rem; border-radius: 999px; font-size: 0.82rem; margin-left: 0.5rem;
+        }
+        .ac-flag-na {
+          background: #fde8e7; border: 1px solid #dc5a5a; color: #9b1c1c;
+          padding: 0.18rem 0.5rem; border-radius: 999px; font-size: 0.82rem; margin-left: 0.5rem;
+        }
         .ac-link {
-          text-decoration:none; padding:0.54rem 1rem; border-radius:12px;
-          border:1px solid #8db0ea; color:#2d62b3; background:#f2f7ff;
-          font-weight: 600;
+          text-decoration:none; padding:0.46rem 0.85rem; border-radius:10px;
+          border:1px solid #96b3e9; color:#0b3b8a;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
+
+def main() -> None:
+    st.title("Acerte Licitacoes - Backup API PNCP")
+    st.caption(
+        "Versao backup usando apenas API oficial PNCP Consulta + municipios IBGE. "
+        "Nao depende da planilha de codigos PNCP."
+    )
+
+    _inject_css()
     _ensure_session_state()
-
-    try:
-        pncp_df = load_municipios_pncp()
-    except Exception as e:
-        st.error(f"Erro ao carregar 'ListaMunicipiosPNCP.csv': {e}")
-        st.stop()
-
-    ibge_df = load_ibge_catalog_local()
-
-    disparar = _sidebar(pncp_df, ibge_df)
-
-    # enriquece código IBGE para selecionados (inclui pesquisas antigas)
-    for m in st.session_state.selected_municipios:
-        cod_ibge = _safe_text(m.get("codigo_ibge"))
-        if not cod_ibge:
-            m["codigo_ibge"] = resolver_codigo_ibge(
-                nome_municipio=_safe_text(m.get("nome")),
-                uf=_safe_text(m.get("uf")),
-                pncp_df=pncp_df,
-                ibge_local_df=ibge_df,
-                codigo_ibge_existente="",
-            )
+    disparar_busca = _sidebar()
 
     status_value = STATUS_MAP.get(st.session_state.sidebar_inputs["status_label"], "")
     palavra_chave = _safe_text(st.session_state.sidebar_inputs["palavra_chave"])
     signature = {
-        "municipios": [m["codigo_pncp"] for m in st.session_state.selected_municipios],
+        "municipios": [m["codigo_ibge"] for m in st.session_state.selected_municipios],
         "municipios_meta": [
             {
-                "codigo_pncp": _safe_text(m.get("codigo_pncp")),
                 "nome": _safe_text(m.get("nome")),
                 "uf": _safe_text(m.get("uf")).upper(),
                 "codigo_ibge": _safe_text(m.get("codigo_ibge")),
@@ -1671,31 +960,37 @@ def main():
         ],
         "status": status_value,
         "q": palavra_chave.lower(),
+        "api": "pncp_consulta_v1",
+        "proposta_dias_a_frente": PROPOSTA_DIAS_A_FRENTE,
     }
 
-    if disparar:
+    if disparar_busca:
         if not signature["municipios"]:
-            st.warning("Selecione pelo menos um município para pesquisar.")
+            st.warning("Selecione pelo menos um municipio para pesquisar.")
             st.stop()
-        with st.spinner("Consultando API de Dados Abertos..."):
-            df = coletar_por_assinatura(signature)
-        st.session_state.results_df = df.to_dict("records")
+        with st.spinner("Consultando API oficial PNCP..."):
+            records, errors = coletar_por_assinatura(signature)
+        st.session_state.results_df = records
+        st.session_state.result_errors = errors
         st.session_state.results_signature = signature
         st.session_state.card_page = 1
     else:
         if st.session_state.results_df is None:
             st.info("Configure os filtros e clique em **Pesquisar**.")
             st.stop()
-        df = pd.DataFrame(st.session_state.results_df)
+        records = st.session_state.results_df
         if st.session_state.results_signature and signature != st.session_state.results_signature:
-            st.warning("Filtros alterados após a última coleta. Clique em **Pesquisar** para atualizar.")
+            st.warning("Filtros alterados apos a ultima coleta. Clique em **Pesquisar** para atualizar.")
 
+    if st.session_state.result_errors:
+        with st.expander("Avisos da coleta"):
+            for err in st.session_state.result_errors:
+                st.warning(err)
+
+    df = pd.DataFrame(records)
     st.subheader(f"Resultados ({len(df)})")
     if df.empty:
-        st.info("Nenhum resultado encontrado com os critérios atuais.")
-        st.caption(
-            "Dica: confirme o município/UF selecionados e teste o status **Todos** para validar se há registros no período."
-        )
+        st.info("Nenhum resultado encontrado com os criterios atuais.")
         return
 
     if "_pub_dt" not in df.columns:
@@ -1707,7 +1002,7 @@ def main():
         df.reset_index(drop=True, inplace=True)
 
     st.selectbox(
-        "Itens por página",
+        "Itens por pagina",
         [10, 20, 50],
         index=[10, 20, 50].index(st.session_state.get("page_size_cards", 10))
         if st.session_state.get("page_size_cards", 10) in [10, 20, 50]
@@ -1715,89 +1010,85 @@ def main():
         key="page_size_cards",
         on_change=_cb_page_size_change,
     )
-    page_size_cards = int(st.session_state.get("page_size_cards", 10))
+
+    page_size = int(st.session_state.get("page_size_cards", 10))
     total_items = len(df)
-    total_pages = max(1, (total_items + page_size_cards - 1) // page_size_cards)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
 
     col_a, col_b, col_c = st.columns([1, 2, 1])
     with col_a:
         st.button(
-            "◀ Anterior",
+            "Anterior",
             key="prev_top",
-            disabled=(st.session_state.get("card_page", 1) <= 1),
+            disabled=st.session_state.get("card_page", 1) <= 1,
             on_click=_cb_prev,
             kwargs={"total_pages": total_pages},
         )
+    with col_b:
+        st.markdown(f"**Pagina {st.session_state.get('card_page', 1)} de {total_pages}**")
     with col_c:
         st.button(
-            "Próxima ▶",
+            "Proxima",
             key="next_top",
-            disabled=(st.session_state.get("card_page", 1) >= total_pages),
+            disabled=st.session_state.get("card_page", 1) >= total_pages,
             on_click=_cb_next,
             kwargs={"total_pages": total_pages},
         )
-    with col_b:
-        st.markdown(f"**Página {st.session_state.get('card_page',1)} de {total_pages}**")
 
-    start = (st.session_state.get("card_page", 1) - 1) * page_size_cards
-    end = start + page_size_cards
+    start = (st.session_state.get("card_page", 1) - 1) * page_size
+    end = start + page_size
     page_df = df.iloc[start:end].copy()
 
     for _, row in page_df.iterrows():
-        uid = _uid_from_row(row)
+        row_dict = row.to_dict()
+        uid = _uid_from_row(row_dict)
         tr_flag = bool(st.session_state.tr_marks.get(uid, False))
         na_flag = bool(st.session_state.na_marks.get(uid, False))
 
         link = _safe_text(row.get("Link para o edital"))
-        titulo = _safe_text(row.get("Título")) or "(Sem título)"
-        cidade = _safe_text(row.get("Cidade"))
-        uf = _safe_text(row.get("UF"))
-        pub = _safe_text(row.get("Publicação"))
-        fim = _safe_text(row.get("Fim do envio de proposta"))
-        objeto = _safe_text(row.get("Objeto"))
-        modalidade = _safe_text(row.get("Modalidade"))
-        tipo = _safe_text(row.get("Tipo")) or _safe_text(row.get("Tipo (documento)")) or "Edital"
-        orgao = _safe_text(row.get("Orgão"))
+        tr_badge = '<span class="ac-flag">TR Elaborado</span>' if tr_flag else ""
+        na_badge = '<span class="ac-flag-na">Nao Atende</span>' if na_flag else ""
+        processo = _safe_text(row.get("numero_processo"))
+        processo_html = f'<div class="ac-muted">Processo: {_escape(processo)}</div>' if processo else "<div></div>"
 
-        html = f'''
+        html_card = f"""
         <div class="ac-card">
-            <h3>{titulo}</h3>
+            <h3>{_escape(row.get("Titulo"))} {tr_badge} {na_badge}</h3>
             <div class="ac-muted">
-                <span class="ac-badge">{cidade} / {uf}</span>
+                <span class="ac-badge">{_escape(row.get("Cidade"))} / {_escape(row.get("UF"))}</span>
                 &nbsp;•&nbsp;
-                <strong>Publicação:</strong> {pub}
+                <strong>Publicacao:</strong> {_escape(row.get("Publicacao"))}
                 &nbsp;|&nbsp;
-                <strong>Fim do envio:</strong> {fim}
+                <strong>Fim do envio:</strong> {_escape(row.get("Fim do envio de proposta"))}
             </div>
-            <div class="ac-obj"><strong>Objeto:</strong> {objeto}</div>
-            <div class="ac-meta">
-                <strong>Modalidade:</strong> {modalidade}
-                &nbsp;&nbsp;
-                <strong>Tipo:</strong> {tipo}
-                &nbsp;&nbsp;
-                <strong>Órgão:</strong> {orgao}
+            <div style="margin-top:0.55rem;"><strong>Objeto:</strong> {_escape(row.get("Objeto"))}</div>
+            <div style="display:flex; gap:1rem; margin-top:0.55rem; flex-wrap:wrap;">
+                <div><strong>Modalidade:</strong> {_escape(row.get("Modalidade"))}</div>
+                <div><strong>Tipo:</strong> {_escape(row.get("Tipo"))}</div>
+                <div><strong>Orgao:</strong> {_escape(row.get("Orgao"))}</div>
             </div>
-            <div class="ac-actions">
-                {f'<a class="ac-link" href="{link}" target="_blank">Abrir edital</a>' if link else ''}
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.7rem;">
+                {processo_html}
+                {f'<a class="ac-link" href="{_escape(link)}" target="_blank">Abrir edital</a>' if link else ''}
             </div>
         </div>
-        '''
-        st.markdown(html, unsafe_allow_html=True)
+        """
+        st.markdown(html_card, unsafe_allow_html=True)
 
         _, col_cb_tr, col_cb_na = st.columns([6, 1.3, 1.3])
         with col_cb_tr:
             new_tr = st.checkbox("TR Elaborado", value=tr_flag, key=f"tr_{uid}")
         with col_cb_na:
-            new_na = st.checkbox("Não Atende", value=na_flag, key=f"na_{uid}")
+            new_na = st.checkbox("Nao Atende", value=na_flag, key=f"na_{uid}")
 
         changed = False
         if new_tr != tr_flag:
             st.session_state.tr_marks[uid] = bool(new_tr)
-            _persist_marks("tr_marks.json", TR_MARKS_PATHS, st.session_state.tr_marks)
+            _persist_marks("tr_marks.json", TR_MARKS_LOCAL, st.session_state.tr_marks)
             changed = True
         if new_na != na_flag:
             st.session_state.na_marks[uid] = bool(new_na)
-            _persist_marks("na_marks.json", NA_MARKS_PATHS, st.session_state.na_marks)
+            _persist_marks("na_marks.json", NA_MARKS_LOCAL, st.session_state.na_marks)
             changed = True
         if changed:
             st.rerun()
@@ -1805,22 +1096,22 @@ def main():
     col_a2, col_b2, col_c2 = st.columns([1, 2, 1])
     with col_a2:
         st.button(
-            "◀ Anterior",
+            "Anterior",
             key="prev_bottom",
-            disabled=(st.session_state.get("card_page", 1) <= 1),
+            disabled=st.session_state.get("card_page", 1) <= 1,
             on_click=_cb_prev,
             kwargs={"total_pages": total_pages},
         )
+    with col_b2:
+        st.markdown(f"**Pagina {st.session_state.get('card_page', 1)} de {total_pages}**")
     with col_c2:
         st.button(
-            "Próxima ▶",
+            "Proxima",
             key="next_bottom",
-            disabled=(st.session_state.get("card_page", 1) >= total_pages),
+            disabled=st.session_state.get("card_page", 1) >= total_pages,
             on_click=_cb_next,
             kwargs={"total_pages": total_pages},
         )
-    with col_b2:
-        st.markdown(f"**Página {st.session_state.get('card_page',1)} de {total_pages}**")
 
     st.divider()
 
@@ -1832,11 +1123,11 @@ def main():
         export_df.to_excel(writer, index=False, sheet_name="PNCP")
     xlsx_bytes = xlsx_buf.getvalue()
 
-    st.markdown("### ⬇️ Baixar planilha")
+    st.markdown("### Baixar planilha")
     st.download_button(
         "Baixar XLSX",
         data=xlsx_bytes,
-        file_name=f"pncp_backup_resultados_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        file_name=f"pncp_backup_api_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         type="primary",

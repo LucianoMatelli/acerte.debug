@@ -44,6 +44,7 @@ HEADERS = {
     "User-Agent": "AcerteLicitacoesBackupAPI/2.0 (+streamlit)",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "pt-BR,pt;q=0.9",
+    "Referer": "https://pncp.gov.br/api/consulta/swagger-ui/index.html",
 }
 
 STATUS_LABELS = [
@@ -118,6 +119,16 @@ TIMEOUT_API = _secret_int("BACKUP_API_TIMEOUT", 30, 5, 120)
 PROPOSTA_DIAS_A_FRENTE = _secret_int("BACKUP_PROPOSTA_DIAS_A_FRENTE", 45, 1, 365)
 PUBLICACAO_DIAS_LOOKBACK = _secret_int("BACKUP_PUBLICACAO_DIAS_LOOKBACK", 365, 1, 365)
 API_RETRIES = _secret_int("BACKUP_API_RETRIES", 3, 1, 5)
+API_DELAY_MS = _secret_int("BACKUP_API_DELAY_MS", 700, 0, 10000)
+
+
+class PncpRequestRejected(RuntimeError):
+    pass
+
+
+def _is_request_rejected_error(exc: Exception | str) -> bool:
+    text = str(exc).lower()
+    return "request_rejected" in text or "rejeitou temporariamente" in text
 
 
 def _fmt_dt_iso_to_br(value: str) -> str:
@@ -388,6 +399,8 @@ def _get_api_page(url: str, params: Dict[str, object]) -> Tuple[List[Dict], int]
     last_error: Optional[Exception] = None
     for attempt in range(API_RETRIES):
         try:
+            if API_DELAY_MS > 0:
+                time.sleep(API_DELAY_MS / 1000)
             r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT_API)
             if r.status_code >= 500 and attempt < API_RETRIES - 1:
                 time.sleep(0.6 * (attempt + 1))
@@ -401,6 +414,9 @@ def _get_api_page(url: str, params: Dict[str, object]) -> Tuple[List[Dict], int]
             body = (r.text or "").strip()
             if not body:
                 return [], 0
+            body_lower = body.lower()
+            if "request rejected" in body_lower or "support id" in body_lower:
+                raise PncpRequestRejected("request_rejected: PNCP rejeitou temporariamente a requisicao")
 
             try:
                 js = r.json()
@@ -421,6 +437,12 @@ def _get_api_page(url: str, params: Dict[str, object]) -> Tuple[List[Dict], int]
                 except Exception:
                     total_pages = 0
             return _items_from_api(js), total_pages
+        except PncpRequestRejected as exc:
+            last_error = exc
+            if attempt < API_RETRIES - 1:
+                time.sleep(3.0 * (attempt + 1))
+                continue
+            raise
         except Exception as exc:
             last_error = exc
             if attempt < API_RETRIES - 1:
@@ -489,6 +511,9 @@ def _buscar_publicacao_municipio(uf: str, codigo_ibge: str) -> Tuple[List[Dict],
                 )
             )
         except Exception as exc:
+            if _is_request_rejected_error(exc):
+                erros.append("PNCP rejeitou temporariamente consultas por publicacao")
+                break
             erros.append(f"modalidade {modalidade}: {exc}")
 
     return rows, erros
@@ -586,33 +611,43 @@ def buscar_municipio_api(municipio: Dict[str, str], status_value: str, q: str) -
             except Exception as exc_agregado:
                 rows = []
                 erros_modalidade: List[str] = []
-                for modalidade in MODALIDADES_CONSULTA:
-                    try:
-                        rows.extend(
-                            _iter_pages(
-                                API_CONSULTA_PROPOSTA,
-                                {
-                                    "dataFinal": data_final,
-                                    "codigoModalidadeContratacao": modalidade,
-                                    "uf": uf,
-                                    "codigoMunicipioIbge": codigo_ibge,
-                                },
+                if _is_request_rejected_error(exc_agregado):
+                    erro_proposta = "PNCP rejeitou temporariamente a consulta por excesso/bloqueio de requisicoes"
+                else:
+                    for modalidade in MODALIDADES_CONSULTA:
+                        try:
+                            rows.extend(
+                                _iter_pages(
+                                    API_CONSULTA_PROPOSTA,
+                                    {
+                                        "dataFinal": data_final,
+                                        "codigoModalidadeContratacao": modalidade,
+                                        "uf": uf,
+                                        "codigoMunicipioIbge": codigo_ibge,
+                                    },
+                                )
                             )
-                        )
-                    except Exception as exc_modalidade:
-                        erros_modalidade.append(f"modalidade {modalidade}: {exc_modalidade}")
+                        except Exception as exc_modalidade:
+                            if _is_request_rejected_error(exc_modalidade):
+                                erros_modalidade.append("PNCP rejeitou temporariamente consultas por modalidade")
+                                break
+                            erros_modalidade.append(f"modalidade {modalidade}: {exc_modalidade}")
                 if not rows:
                     detalhe = "; ".join(erros_modalidade[:3])
-                    erro_proposta = f"consulta por proposta falhou ({exc_agregado}); {detalhe}"
+                    if not erro_proposta:
+                        erro_proposta = f"consulta por proposta falhou ({exc_agregado}); {detalhe}"
 
             if not rows:
-                rows_publicacao, erros_publicacao = _buscar_publicacao_municipio(uf, codigo_ibge)
-                rows = rows_publicacao
-                aplicar_filtro_publicacao = True
-                if not rows_publicacao and erros_publicacao:
-                    detalhe = "; ".join(erros_publicacao[:3])
-                    prefixo = f"{erro_proposta}; " if erro_proposta else ""
-                    erros.append(f"{municipio.get('nome')} / {uf}: {prefixo}recuperacao por publicacao falhou; {detalhe}")
+                if _is_request_rejected_error(erro_proposta):
+                    erros.append(f"{municipio.get('nome')} / {uf}: {erro_proposta}. Tente novamente em alguns minutos.")
+                else:
+                    rows_publicacao, erros_publicacao = _buscar_publicacao_municipio(uf, codigo_ibge)
+                    rows = rows_publicacao
+                    aplicar_filtro_publicacao = True
+                    if not rows_publicacao and erros_publicacao:
+                        detalhe = "; ".join(erros_publicacao[:3])
+                        prefixo = f"{erro_proposta}; " if erro_proposta else ""
+                        erros.append(f"{municipio.get('nome')} / {uf}: {prefixo}recuperacao por publicacao falhou; {detalhe}")
         else:
             rows, erros_publicacao = _buscar_publicacao_municipio(uf, codigo_ibge)
             if not rows and erros_publicacao:

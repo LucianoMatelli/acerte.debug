@@ -615,7 +615,7 @@ def buscar_municipio_api(municipio: Dict[str, str], status_value: str, q: str) -
     return registros, erros
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def coletar_por_assinatura(signature: dict) -> Tuple[List[Dict], List[str]]:
     registros: List[Dict] = []
     erros: List[str] = []
@@ -678,10 +678,16 @@ def _ensure_session_state() -> None:
         st.session_state.na_marks = _load_marks("na_marks.json", NA_MARKS_LOCAL)
 
 
-def _normalize_municipio_payload(m: Dict) -> Optional[Dict[str, str]]:
+def _normalize_municipio_payload(m: Dict, fallback_uf: str = "") -> Optional[Dict[str, str]]:
     nome = _safe_text(m.get("nome") or m.get("municipio") or m.get("Cidade"))
-    uf = _safe_text(m.get("uf") or m.get("UF")).upper()
-    codigo_ibge = _safe_text(m.get("codigo_ibge") or m.get("codigoIbge") or m.get("ibge"))
+    uf = _safe_text(m.get("uf") or m.get("UF") or fallback_uf).upper()
+    codigo_ibge = _safe_text(
+        m.get("codigo_ibge")
+        or m.get("codigoIbge")
+        or m.get("ibge")
+        or m.get("codigo_municipio_ibge")
+        or m.get("municipio_ibge")
+    )
 
     if nome and uf and codigo_ibge.isdigit():
         return {"nome": nome, "uf": uf, "codigo_ibge": codigo_ibge}
@@ -833,9 +839,15 @@ def _sidebar() -> bool:
     if carregar and selected_saved and selected_saved != "—":
         payload = st.session_state.saved_searches.get(selected_saved, {})
         municipios: List[Dict[str, str]] = []
-        for raw in payload.get("municipios", []):
+        fallback_uf = _safe_text(payload.get("uf")).upper()
+        raw_municipios = payload.get("municipios") or payload.get("selected_municipios") or []
+        for raw in raw_municipios:
             if isinstance(raw, dict):
-                normalized = _normalize_municipio_payload(raw)
+                normalized = _normalize_municipio_payload(raw, fallback_uf=fallback_uf)
+                if normalized:
+                    municipios.append(normalized)
+            elif isinstance(raw, str) and fallback_uf:
+                normalized = resolver_municipio_ibge(raw, fallback_uf)
                 if normalized:
                     municipios.append(normalized)
 
@@ -948,6 +960,8 @@ def main() -> None:
 
     status_value = STATUS_MAP.get(st.session_state.sidebar_inputs["status_label"], "")
     palavra_chave = _safe_text(st.session_state.sidebar_inputs["palavra_chave"])
+    data_final_proposta = (datetime.now() + timedelta(days=PROPOSTA_DIAS_A_FRENTE)).strftime("%Y%m%d")
+    data_final_publicacao = datetime.now().strftime("%Y%m%d")
     signature = {
         "municipios": [m["codigo_ibge"] for m in st.session_state.selected_municipios],
         "municipios_meta": [
@@ -962,6 +976,8 @@ def main() -> None:
         "q": palavra_chave.lower(),
         "api": "pncp_consulta_v1",
         "proposta_dias_a_frente": PROPOSTA_DIAS_A_FRENTE,
+        "data_final_proposta": data_final_proposta,
+        "data_final_publicacao": data_final_publicacao,
     }
 
     if disparar_busca:
@@ -1045,6 +1061,26 @@ def main() -> None:
         tr_flag = bool(st.session_state.tr_marks.get(uid, False))
         na_flag = bool(st.session_state.na_marks.get(uid, False))
 
+        col_spacer, col_cb_tr, col_cb_na = st.columns([6, 1.3, 1.3])
+        with col_cb_tr:
+            new_tr = st.checkbox("TR Elaborado", value=tr_flag, key=f"tr_{uid}")
+        with col_cb_na:
+            new_na = st.checkbox("Nao Atende", value=na_flag, key=f"na_{uid}")
+
+        changed = False
+        if new_tr != tr_flag:
+            st.session_state.tr_marks[uid] = bool(new_tr)
+            tr_flag = bool(new_tr)
+            changed = True
+        if new_na != na_flag:
+            st.session_state.na_marks[uid] = bool(new_na)
+            na_flag = bool(new_na)
+            changed = True
+        if changed:
+            _persist_marks("tr_marks.json", TR_MARKS_LOCAL, st.session_state.tr_marks)
+            _persist_marks("na_marks.json", NA_MARKS_LOCAL, st.session_state.na_marks)
+            st.rerun()
+
         link = _safe_text(row.get("Link para o edital"))
         tr_badge = '<span class="ac-flag">TR Elaborado</span>' if tr_flag else ""
         na_badge = '<span class="ac-flag-na">Nao Atende</span>' if na_flag else ""
@@ -1074,24 +1110,6 @@ def main() -> None:
         </div>
         """
         st.markdown(html_card, unsafe_allow_html=True)
-
-        _, col_cb_tr, col_cb_na = st.columns([6, 1.3, 1.3])
-        with col_cb_tr:
-            new_tr = st.checkbox("TR Elaborado", value=tr_flag, key=f"tr_{uid}")
-        with col_cb_na:
-            new_na = st.checkbox("Nao Atende", value=na_flag, key=f"na_{uid}")
-
-        changed = False
-        if new_tr != tr_flag:
-            st.session_state.tr_marks[uid] = bool(new_tr)
-            _persist_marks("tr_marks.json", TR_MARKS_LOCAL, st.session_state.tr_marks)
-            changed = True
-        if new_na != na_flag:
-            st.session_state.na_marks[uid] = bool(new_na)
-            _persist_marks("na_marks.json", NA_MARKS_LOCAL, st.session_state.na_marks)
-            changed = True
-        if changed:
-            st.rerun()
 
     col_a2, col_b2, col_c2 = st.columns([1, 2, 1])
     with col_a2:

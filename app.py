@@ -392,33 +392,43 @@ def _get_api_page(url: str, params: Dict[str, object]) -> Tuple[List[Dict], int]
             if r.status_code >= 500 and attempt < API_RETRIES - 1:
                 time.sleep(0.6 * (attempt + 1))
                 continue
-            break
+
+            if r.status_code in (204, 404):
+                return [], 0
+            if r.status_code >= 400:
+                raise RuntimeError(f"HTTP {r.status_code}: {(r.text or '')[:180]}")
+
+            body = (r.text or "").strip()
+            if not body:
+                return [], 0
+
+            try:
+                js = r.json()
+            except Exception as exc:
+                last_error = exc
+                if attempt < API_RETRIES - 1:
+                    time.sleep(0.6 * (attempt + 1))
+                    continue
+                ctype = _safe_text(r.headers.get("content-type"))
+                raise RuntimeError(
+                    f"invalid_json HTTP {r.status_code} content-type {ctype}: {body[:180]}"
+                ) from exc
+
+            total_pages = 0
+            if isinstance(js, dict):
+                try:
+                    total_pages = int(js.get("totalPaginas") or 0)
+                except Exception:
+                    total_pages = 0
+            return _items_from_api(js), total_pages
         except Exception as exc:
             last_error = exc
             if attempt < API_RETRIES - 1:
                 time.sleep(0.6 * (attempt + 1))
                 continue
             raise RuntimeError(f"request_error: {exc}") from exc
-    else:
-        raise RuntimeError(f"request_error: {last_error}")
 
-    if r.status_code in (204, 404):
-        return [], 0
-    if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code}: {(r.text or '')[:180]}")
-
-    body = (r.text or "").strip()
-    if not body:
-        return [], 0
-
-    js = r.json()
-    total_pages = 0
-    if isinstance(js, dict):
-        try:
-            total_pages = int(js.get("totalPaginas") or 0)
-        except Exception:
-            total_pages = 0
-    return _items_from_api(js), total_pages
+    raise RuntimeError(f"request_error: {last_error}")
 
 
 def _iter_pages(url: str, base_params: Dict[str, object]) -> List[Dict]:
@@ -445,14 +455,43 @@ def _status_match_publicacao(item: Dict, status_value: str) -> bool:
     fim = pd.to_datetime(item.get("dataEncerramentoProposta"), errors="coerce", utc=False)
     now = pd.Timestamp.now()
 
+    recebendo = bool(pd.notna(fim) and fim >= now)
     encerrada_por_data = bool(pd.notna(fim) and fim < now)
     cancelada_ou_final = situacao in {"2", "3", "4"}
 
+    if status_value == "recebendo_proposta":
+        return situacao == "1" and recebendo
     if status_value == "em_julgamento":
         return situacao == "1" and encerrada_por_data
     if status_value == "encerrado":
         return cancelada_ou_final or encerrada_por_data
     return True
+
+
+def _buscar_publicacao_municipio(uf: str, codigo_ibge: str) -> Tuple[List[Dict], List[str]]:
+    data_final = datetime.now().strftime("%Y%m%d")
+    data_inicial = (datetime.now() - timedelta(days=PUBLICACAO_DIAS_LOOKBACK)).strftime("%Y%m%d")
+    rows: List[Dict] = []
+    erros: List[str] = []
+
+    for modalidade in MODALIDADES_CONSULTA:
+        try:
+            rows.extend(
+                _iter_pages(
+                    API_CONSULTA_PUBLICACAO,
+                    {
+                        "dataInicial": data_inicial,
+                        "dataFinal": data_final,
+                        "codigoModalidadeContratacao": modalidade,
+                        "uf": uf,
+                        "codigoMunicipioIbge": codigo_ibge,
+                    },
+                )
+            )
+        except Exception as exc:
+            erros.append(f"modalidade {modalidade}: {exc}")
+
+    return rows, erros
 
 
 def _normalizar_item(item: Dict, municipio_ref: Dict[str, str]) -> Dict:
@@ -529,10 +568,12 @@ def buscar_municipio_api(municipio: Dict[str, str], status_value: str, q: str) -
     registros: List[Dict] = []
     erros: List[str] = []
     vistos = set()
+    aplicar_filtro_publicacao = status_value != "recebendo_proposta"
 
     try:
         if status_value == "recebendo_proposta":
             data_final = (datetime.now() + timedelta(days=PROPOSTA_DIAS_A_FRENTE)).strftime("%Y%m%d")
+            erro_proposta = ""
             try:
                 rows = _iter_pages(
                     API_CONSULTA_PROPOSTA,
@@ -562,31 +603,28 @@ def buscar_municipio_api(municipio: Dict[str, str], status_value: str, q: str) -
                         erros_modalidade.append(f"modalidade {modalidade}: {exc_modalidade}")
                 if not rows:
                     detalhe = "; ".join(erros_modalidade[:3])
-                    erros.append(f"{municipio.get('nome')} / {uf}: consulta agregada falhou ({exc_agregado}); {detalhe}")
+                    erro_proposta = f"consulta por proposta falhou ({exc_agregado}); {detalhe}"
+
+            if not rows:
+                rows_publicacao, erros_publicacao = _buscar_publicacao_municipio(uf, codigo_ibge)
+                rows = rows_publicacao
+                aplicar_filtro_publicacao = True
+                if not rows_publicacao and erros_publicacao:
+                    detalhe = "; ".join(erros_publicacao[:3])
+                    prefixo = f"{erro_proposta}; " if erro_proposta else ""
+                    erros.append(f"{municipio.get('nome')} / {uf}: {prefixo}recuperacao por publicacao falhou; {detalhe}")
         else:
-            data_final = datetime.now().strftime("%Y%m%d")
-            data_inicial = (datetime.now() - timedelta(days=PUBLICACAO_DIAS_LOOKBACK)).strftime("%Y%m%d")
-            rows = []
-            for modalidade in MODALIDADES_CONSULTA:
-                rows.extend(
-                    _iter_pages(
-                        API_CONSULTA_PUBLICACAO,
-                        {
-                            "dataInicial": data_inicial,
-                            "dataFinal": data_final,
-                            "codigoModalidadeContratacao": modalidade,
-                            "uf": uf,
-                            "codigoMunicipioIbge": codigo_ibge,
-                        },
-                    )
-                )
+            rows, erros_publicacao = _buscar_publicacao_municipio(uf, codigo_ibge)
+            if not rows and erros_publicacao:
+                detalhe = "; ".join(erros_publicacao[:3])
+                erros.append(f"{municipio.get('nome')} / {uf}: consulta por publicacao falhou; {detalhe}")
     except Exception as exc:
         erros.append(f"{municipio.get('nome')} / {uf}: {exc}")
         rows = []
 
     q_norm = _norm(q)
     for item in rows:
-        if status_value != "recebendo_proposta" and not _status_match_publicacao(item, status_value):
+        if aplicar_filtro_publicacao and not _status_match_publicacao(item, status_value):
             continue
 
         key = _dedupe_key(item)
